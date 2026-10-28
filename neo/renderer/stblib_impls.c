@@ -6,6 +6,9 @@
 #if defined(__APPLE__) && !defined(__clang__) && defined(__GNUC__) && __GNUC__ < 5
   // Extra-Hack for ancient GCC 4.2-based Apple compilers that don't support __thread
   #define STBI_NO_THREAD_LOCALS
+#elif defined(__WIIU__)
+  // elf2rpl can't convert TLS relocations, and only the main thread loads images anyway
+  #define STBI_NO_THREAD_LOCALS
 #endif
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_NO_HDR

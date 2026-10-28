@@ -186,8 +186,8 @@ If you have questions concerning this license or the applicable additional terms
 #endif
 
 
-// Unix
-#ifdef __unix__
+// Unix (and the Wii U, whose devkitPPC/newlib environment is close enough)
+#if defined(__unix__) || defined(__WIIU__)
 
 #ifdef	__GNUC__
   // NOTE: Do *not* use __builtin_alloca_with_align(), unlike regular alloca it frees at end of block instead of end of function !

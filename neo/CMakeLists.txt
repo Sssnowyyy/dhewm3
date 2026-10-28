@@ -65,6 +65,19 @@ option(TRACY		"Build and integrate the Tracy profiler, requires HARDLINK_GAME" O
 
 option(HARDLINK_GAME "Compile gamecode into executable (no game DLLs)" OFF)
 
+if(WIIU)
+	# Cafe OS has no dynamic loading for homebrew, no OpenGL and no OpenAL (yet),
+	# so build a single .rpx with the base game linked in and the renderer and
+	# sound backends stubbed out (like the dedicated server does)
+	message(STATUS "Building for Wii U: forcing HARDLINK_GAME, disabling D3XP, IMGUI, DEDICATED")
+	set(HARDLINK_GAME ON)
+	set(D3XP OFF)
+	set(IMGUI OFF)
+	set(DEDICATED OFF)
+	set(SDL2 ON)
+	set(SDL3 OFF)
+endif()
+
 if(NOT MSVC) # GCC/clang or compatible, hopefully
 	option(FORCE_COLORED_OUTPUT "Always produce ANSI-colored compiler warnings/errors (GCC/Clang only; esp. useful with ninja)." OFF)
 	option(ASAN		"Enable GCC/Clang Adress Sanitizer (ASan)" OFF) # TODO: MSVC might also support this, somehow?
@@ -141,6 +154,8 @@ endif()
 # target os
 if(APPLE)
 	set(os "macosx")
+elseif(WIIU)
+	set(os "wiiu")
 else()
 	string(TOLOWER "${CMAKE_SYSTEM_NAME}" os)
 endif()
@@ -194,8 +209,14 @@ if(CMAKE_MAJOR_VERSION LESS 3 OR ( CMAKE_MAJOR_VERSION EQUAL 3 AND CMAKE_MINOR_V
 endif()
 
 # libs
-find_package(OpenAL REQUIRED)
-include_directories(${OPENAL_INCLUDE_DIR})
+if(WIIU)
+	# no OpenAL implementation on Wii U yet - just its headers, for sys/stub/openal_stub.cpp
+	include_directories("${CMAKE_SOURCE_DIR}/sys/wiiu/include")
+	set(OPENAL_LIBRARY "")
+else()
+	find_package(OpenAL REQUIRED)
+	include_directories(${OPENAL_INCLUDE_DIR})
+endif()
 
 if (SDL3)
 	if(SDL2)
@@ -216,7 +237,12 @@ elseif (SDL2)
 	endif()
 	find_package(SDL2 REQUIRED)
 	include_directories(${SDL2_INCLUDE_DIR})
-	set(SDLx_LIBRARY ${SDL2_LIBRARY})
+	if(WIIU)
+		# wiiu-sdl2 only provides a CMake config with a static target, no SDL2_LIBRARY
+		set(SDLx_LIBRARY SDL2::SDL2-static)
+	else()
+		set(SDLx_LIBRARY ${SDL2_LIBRARY})
+	endif()
 else()
 	# skip SDLmain
 	if(APPLE OR WIN32)
@@ -250,7 +276,10 @@ else()
 	add_definitions(-DIMGUI_DISABLE)
 endif()
 
-if(NOT IMGUI)
+if(WIIU)
+	# wut's headers use static_assert
+	set (CMAKE_CXX_STANDARD 11)
+elseif(NOT IMGUI)
 	# without ImGui C++98 should suffices, preserves compatibility
 	# with vintage system like PPC Macs
 	set (CMAKE_CXX_STANDARD 98)
@@ -463,7 +492,10 @@ if(D3_COMPILER_IS_GCC_OR_CLANG)
 		set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-c++20-compat")
 	endif()
 
-	if(AROS)
+	if(WIIU)
+		# newlib has no fopen64() etc, its off_t is 64bit anyway
+		add_definitions(-DIOAPI_NO_64)
+	elseif(AROS)
 		set(CMAKE_SHARED_LIBRARY_SUFFIX ".aros-${cpu}")
 		add_definitions(-DIOAPI_NO_64)
 	elseif(APPLE)
@@ -1183,7 +1215,22 @@ else()
 endif()
 
 
-if(AROS)
+if(WIIU)
+	set(src_sys_base
+		sys/cpu.cpp
+		sys/threads.cpp
+		sys/events.cpp
+		sys/sys_local.cpp
+		sys/wiiu/wiiu_main.cpp
+		sys/wiiu/wiiu_net.cpp
+	)
+
+	# TODO: replace the stubs with a GX2 renderer and a real sound backend
+	set(src_sys_core
+		${src_stub_gl}
+		${src_stub_openal}
+	)
+elseif(AROS)
 	set(DHEWM3BINARY "ADoom3")
 	set(sys_libs ${sys_libs} dynmod)
 
@@ -1296,7 +1343,7 @@ if (AROS)
 		set(AROS_ARCH ${CMAKE_SYSTEM_PROCESSOR})
 	endif()
 else()
-	if(D3_COMPILER_IS_GCC_OR_CLANG AND NOT MINGW)
+	if(D3_COMPILER_IS_GCC_OR_CLANG AND NOT MINGW AND NOT WIIU)
 		set_target_properties(idlib PROPERTIES COMPILE_FLAGS "-fPIC")
 	endif()
 endif()
@@ -1351,6 +1398,10 @@ endif()
 		${SDLx_LIBRARY}
 		${sys_libs}
 	)
+
+	if(WIIU)
+		wut_create_rpx(${DHEWM3BINARY})
+	endif()
 
 	if(NOT APPLE AND NOT WIN32)
 		install(TARGETS ${DHEWM3BINARY}
