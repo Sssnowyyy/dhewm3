@@ -3024,6 +3024,11 @@ void idCommonLocal::Init( int argc, char **argv ) {
 		if ( SDL_Init(SDL_INIT_VIDEO) ) { // retry without joystick/gamepad if it failed
 			Sys_Printf( "WARNING: Couldn't get SDL gamepad support! Gamepads won't work!\n" );
 		} else
+#elif defined(__WIIU__)
+	// GX2 and the app lifecycle (ProcUI) are handled in sys/wiiu/, SDL's Wii U video
+	// driver would want to own both - so only use SDL for input
+	if (SDL_Init(SDL_INIT_TIMER | SDL_INIT_JOYSTICK | SDL_INIT_GAMECONTROLLER) != 0)
+	{
 #elif SDL_VERSION_ATLEAST(2, 0, 0)
 	if (SDL_Init(SDL_INIT_TIMER | SDL_INIT_VIDEO | SDL_INIT_JOYSTICK | SDL_INIT_GAMECONTROLLER) != 0)
 	{

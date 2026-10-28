@@ -246,6 +246,10 @@ void idVertexCache::Alloc( void *data, int size, vertCache_t **buffer, bool inde
 
 			if( !virtualMemory ) {
 				qglGenBuffersARB( 1, & block->vbo );
+			} else {
+				// headerAllocator doesn't zero its memory, and a garbage vbo would
+				// make the copy below call the (NULL) VBO functions
+				block->vbo = 0;
 			}
 		}
 	}

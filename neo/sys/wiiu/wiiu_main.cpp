@@ -35,11 +35,11 @@ If you have questions concerning this license or the applicable additional terms
 #include <errno.h>
 #include <dirent.h>
 #include <unistd.h>
+#include <malloc.h>
 
 #include <coreinit/time.h>
 #include <coreinit/thread.h>
-#include <coreinit/memheap.h>
-#include <coreinit/memexpheap.h>
+#include <coreinit/memory.h>
 #include <sysapp/launch.h>
 #include <whb/proc.h>
 #include <whb/log.h>
@@ -51,6 +51,7 @@ If you have questions concerning this license or the applicable additional terms
 #include "framework/FileSystem.h"
 #include "framework/Licensee.h"
 #include "sys/sys_local.h"
+#include "sys/sys_sdl.h"
 
 // game data, config and savegames all live here on the SD card:
 //   sd:/wiiu/apps/dhewm3/base/pak000.pk4 ...
@@ -59,15 +60,27 @@ If you have questions concerning this license or the applicable additional terms
 idCVar com_pid( "com_pid", "0", CVAR_INTEGER | CVAR_INIT | CVAR_SYSTEM, "process id" );
 
 static FILE* consoleLog = NULL;
-static bool procReleased = false; // ProcUI already let us go (HOME menu "close software")
+static OSTime lastLogSync = 0;
+static OSThread* engineThread = NULL;
+static bool procExiting = false; // ProcUI told us to exit (HOME menu "close software")
+
+static void Wiiu_SyncLog() {
+	if ( consoleLog != NULL ) {
+		fflush( consoleLog );
+		fsync( fileno( consoleLog ) );
+		lastLogSync = OSGetSystemTime();
+	}
+}
 
 /*
 ================
 Wiiu_Exit
 
-Cafe OS apps must not just exit() while ProcUI is running: ask the system to
-go back to the menu, keep the ProcUI loop alive until it releases us, and
-only then shut down.
+Cafe OS apps can't just exit() while ProcUI is running: unless ProcUI already
+told us to exit, ask the system to go back to the menu and keep processing
+ProcUI messages until it releases us.
+The engine runs on its own thread (see main()), so end that thread and let
+main() return instead of calling exit() from it.
 ================
 */
 static void Wiiu_Exit( int ret ) {
@@ -76,17 +89,20 @@ static void Wiiu_Exit( int ret ) {
 		consoleLog = NULL;
 	}
 
-	if ( !procReleased ) {
+	// common->Shutdown() already did this unless we're here because of Sys_Error()
+	SDL_Quit();
+
+	if ( !procExiting ) {
 		SYSLaunchMenu();
 		while ( WHBProcIsRunning() ) {
 			OSSleepTicks( OSMillisecondsToTicks( 10 ) );
 		}
 	}
-
-	WHBLogUdpDeinit();
-	WHBLogCafeDeinit();
 	WHBProcShutdown();
 
+	if ( OSGetCurrentThread() == engineThread ) {
+		OSExitThread( ret );
+	}
 	exit( ret );
 }
 
@@ -197,9 +213,13 @@ void Sys_Shutdown( void ) {
 
 // returns in megabytes
 int Sys_GetSystemRam( void ) {
-	MEMHeapHandle mem2 = MEMGetBaseHeapHandle( MEM_BASE_HEAP_MEM2 );
-	uint32_t freeBytes = MEMGetTotalFreeSizeForExpHeap( mem2 );
-	int mb = (int)( freeBytes / ( 1024 * 1024 ) );
+	// wut hands the whole MEM2 heap to malloc() at startup, so asking the heap
+	// how much is free returns 0 - report the size of the app's MEM2 area instead
+	uint32_t addr = 0, size = 0;
+	if ( OSGetMemBound( OS_MEM2, &addr, &size ) != 0 ) {
+		return 512;
+	}
+	int mb = (int)( size / ( 1024 * 1024 ) );
 	// round to the nearest 16Mb
 	return ( mb + 8 ) & ~15;
 }
@@ -300,8 +320,12 @@ void Sys_VPrintf( const char *msg, va_list arg ) {
 
 	if ( consoleLog != NULL ) {
 		fputs( buf, consoleLog );
-		// we're likely to get killed by the HOME button or a crash, so don't buffer
-		fflush( consoleLog );
+		// a crash would lose whatever is still buffered, but syncing the SD card
+		// for every line slows down loading, so do it at most once per second
+		// (Cemu doesn't even write anything to the host file before that)
+		if ( OSGetSystemTime() - lastLogSync > OSSecondsToTicks( 1 ) ) {
+			Wiiu_SyncLog();
+		}
 	}
 }
 
@@ -331,6 +355,7 @@ void Sys_Error( const char *error, ... ) {
 	Sys_DebugVPrintf( error, argptr );
 	va_end( argptr );
 	Sys_Printf( "\n" );
+	Wiiu_SyncLog();
 
 	Wiiu_Exit( EXIT_FAILURE );
 }
@@ -340,8 +365,70 @@ void Sys_Error( const char *error, ... ) {
 main
 ===============
 */
-int main( int argc, char **argv ) {
+
+// Doom 3 _alloca()s up to ID_MAX_ALLOCA_SIZE (1MB) at once, but the RPX main
+// thread only gets elf2rpl's default 64KB stack - so run the engine on a thread
+// with a big stack instead.
+#define ENGINE_STACK_SIZE ( 8 * 1024 * 1024 )
+
+static int EngineThreadMain( int argc, const char **argv ) {
+	// ProcUI has to be handled on the main core, which this thread runs on
 	WHBProcInit();
+
+	// Cafe OS doesn't pass useful arguments to homebrew, so these are the defaults
+	// for the Wii U: render at the TV's 720p, the GamePad gets a scaled copy
+	static const char *defaultArgs[] = {
+		"+set", "r_mode", "-1",
+		"+set", "r_customWidth", "1280",
+		"+set", "r_customHeight", "720",
+		"+set", "r_fullscreen", "1",
+		// needs a depth texture and its own shader port, TODO
+		"+set", "r_useSoftParticles", "0",
+	};
+	static char *args[64];
+	int numArgs = 0;
+	for ( size_t i = 0; i < sizeof( defaultArgs ) / sizeof( defaultArgs[0] ); i++ ) {
+		args[numArgs++] = (char *)defaultArgs[i];
+	}
+
+	// the GamePad is the only input, but dhewm3 has no gamepad bindings by default:
+	// on the first start (nothing saved yet) use the ones from base/gamepad.cfg.
+	// SDL thinks the GamePad is XBox-like, but its buttons are laid out like Nintendo's
+	struct stat st;
+	if ( stat( WIIU_DATA_PATH "/" BASE_GAMEDIR "/" CONFIG_FILE, &st ) != 0 ) {
+		static const char *firstStartArgs[] = { "+exec", "gamepad.cfg", "+set", "joy_gamepadLayout", "1" };
+		for ( size_t i = 0; i < sizeof( firstStartArgs ) / sizeof( firstStartArgs[0] ); i++ ) {
+			args[numArgs++] = (char *)firstStartArgs[i];
+		}
+	}
+
+	// more arguments (like "+map game/mars_city1") can be put into args.txt
+	static char extraArgs[1024];
+	FILE *f = fopen( WIIU_DATA_PATH "/args.txt", "r" );
+	if ( f ) {
+		size_t len = fread( extraArgs, 1, sizeof( extraArgs ) - 1, f );
+		fclose( f );
+		extraArgs[len] = '\0';
+		char *tok = strtok( extraArgs, " \t\r\n" );
+		while ( tok && numArgs < (int)( sizeof( args ) / sizeof( args[0] ) ) ) {
+			args[numArgs++] = tok;
+			tok = strtok( NULL, " \t\r\n" );
+		}
+	}
+
+	common->Init( numArgs, args );
+
+	while ( WHBProcIsRunning() ) {
+		common->Frame();
+	}
+
+	// the user closed us from the HOME menu
+	procExiting = true;
+	common->Quit(); // ends in Sys_Quit(), which ends this thread
+	return 0;
+}
+
+int main( int argc, char **argv ) {
 	WHBLogCafeInit();
 	WHBLogUdpInit();
 
@@ -350,15 +437,27 @@ int main( int argc, char **argv ) {
 
 	Wiiu_InitTime();
 
-	// Cafe OS doesn't pass useful arguments to homebrew
-	common->Init( 0, NULL );
-
-	while ( WHBProcIsRunning() ) {
-		common->Frame();
+	OSThread *mainThread = OSGetCurrentThread();
+	engineThread = (OSThread *)memalign( 16, sizeof( OSThread ) );
+	uint8_t *stack = (uint8_t *)memalign( 16, ENGINE_STACK_SIZE );
+	if ( engineThread == NULL || stack == NULL ) {
+		WHBLogPrint( "dhewm3: couldn't allocate the engine thread" );
+		return EXIT_FAILURE;
 	}
 
-	// the user left via the HOME menu, ProcUI already released us
-	procReleased = true;
-	common->Quit(); // calls Sys_Quit(), doesn't return
-	return 0;
+	// stay on the main core (CPU1): ProcUI has to be handled there
+	if ( !OSCreateThread( engineThread, EngineThreadMain, 0, NULL, stack + ENGINE_STACK_SIZE,
+			ENGINE_STACK_SIZE, OSGetThreadPriority( mainThread ), OS_THREAD_ATTRIB_AFFINITY_CPU1 ) ) {
+		WHBLogPrint( "dhewm3: couldn't create the engine thread" );
+		return EXIT_FAILURE;
+	}
+	OSSetThreadName( engineThread, "dhewm3 engine" );
+	OSResumeThread( engineThread );
+
+	int ret = EXIT_SUCCESS;
+	OSJoinThread( engineThread, &ret );
+
+	WHBLogUdpDeinit();
+	WHBLogCafeDeinit();
+	return ret;
 }

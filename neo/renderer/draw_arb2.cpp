@@ -689,6 +689,12 @@ void R_LoadARBProgram( int progIndex ) {
 	qglBindProgramARB( progs[progIndex].target, progs[progIndex].ident );
 	qglGetError();
 
+#ifdef __WIIU__
+	// GX2 can't compile ARB programs, the Wii U uses GLSL ports of them picked by file name
+	extern void GX2GL_NameProgram( GLenum target, GLuint ident, const char *name );
+	GX2GL_NameProgram( progs[progIndex].target, progs[progIndex].ident, progs[progIndex].name );
+#endif
+
 	qglProgramStringARB( progs[progIndex].target, GL_PROGRAM_FORMAT_ASCII_ARB,
 		strlen( start ), start );
 
