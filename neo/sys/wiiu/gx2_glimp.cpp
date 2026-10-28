@@ -50,6 +50,7 @@ If you have questions concerning this license or the applicable additional terms
 
 GX2ColorBuffer		gx2ColorBuffer;
 GX2DepthBuffer		gx2DepthBuffer;
+GX2ColorBuffer		gx2DepthColorBuffer;
 GX2ContextState *	gx2ContextState;
 bool				gx2Foreground;
 
@@ -65,7 +66,7 @@ static glimpParms_t	curParms;
 static const GX2TVRenderMode TV_RENDER_MODE = GX2_TV_RENDER_MODE_WIDE_720P;
 static const GX2SurfaceFormat SCAN_FORMAT = GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8;
 
-idCVar r_gx2Test( "r_gx2Test", "0", CVAR_RENDERER | CVAR_BOOL, "debug: draw a test pattern on top of every frame" );
+idCVar r_gx2Test( "r_gx2Test", "0", CVAR_RENDERER | CVAR_INTEGER, "debug: 1: draw a test pattern on top of every frame, 2: show the captured (packed) depth texture, 3: show a white texture instead" );
 // NOTE: doesn't work in Cemu, which doesn't write GPU rendered surfaces back to emulated memory
 idCVar r_gx2DumpFrame( "r_gx2DumpFrame", "0", CVAR_RENDERER | CVAR_INTEGER, "debug: write frame N to dhewm3frame.tga on the SD card" );
 
@@ -162,7 +163,7 @@ bool GLimp_Init( glimpParms_t parms ) {
 	gx2DepthBuffer.surface.height = parms.height;
 	gx2DepthBuffer.surface.depth = 1;
 	gx2DepthBuffer.surface.mipLevels = 1;
-	gx2DepthBuffer.surface.format = GX2_SURFACE_FORMAT_FLOAT_D24_S8;
+	gx2DepthBuffer.surface.format = GX2_SURFACE_FORMAT_UNORM_R24_X8;
 	gx2DepthBuffer.surface.aa = GX2_AA_MODE1X;
 	gx2DepthBuffer.surface.use = GX2_SURFACE_USE_DEPTH_BUFFER;
 	gx2DepthBuffer.surface.tileMode = GX2_TILE_MODE_DEFAULT;
@@ -172,10 +173,21 @@ bool GLimp_Init( glimpParms_t parms ) {
 	AllocSurface( gx2DepthBuffer.surface );
 	GX2InitDepthBufferRegs( &gx2DepthBuffer );
 
+	memset( &gx2DepthColorBuffer, 0, sizeof( gx2DepthColorBuffer ) );
+	gx2DepthColorBuffer.surface = gx2ColorBuffer.surface;
+	// depth packed into RGBA8 by the shaders, float formats didn't work in Cemu
+	gx2DepthColorBuffer.surface.format = GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8;
+	gx2DepthColorBuffer.surface.use = (GX2SurfaceUse)( GX2_SURFACE_USE_TEXTURE | GX2_SURFACE_USE_COLOR_BUFFER );
+	gx2DepthColorBuffer.surface.image = NULL;
+	gx2DepthColorBuffer.viewNumSlices = 1;
+	AllocSurface( gx2DepthColorBuffer.surface );
+	GX2InitColorBufferRegs( &gx2DepthColorBuffer );
+
 	gx2ContextState = (GX2ContextState *)memalign( GX2_CONTEXT_STATE_ALIGNMENT, sizeof( GX2ContextState ) );
 	GX2SetupContextStateEx( gx2ContextState, TRUE );
 	GX2SetContextState( gx2ContextState );
 	GX2SetColorBuffer( &gx2ColorBuffer, GX2_RENDER_TARGET_0 );
+	GX2SetColorBuffer( &gx2DepthColorBuffer, GX2_RENDER_TARGET_1 );
 	GX2SetDepthBuffer( &gx2DepthBuffer );
 	GX2SetViewport( 0, 0, parms.width, parms.height, 0.0f, 1.0f );
 	GX2SetScissor( 0, 0, parms.width, parms.height );
@@ -204,6 +216,7 @@ void GLimp_Shutdown( void ) {
 	GX2Shutdown();
 	free( gx2ColorBuffer.surface.image );
 	free( gx2DepthBuffer.surface.image );
+	free( gx2DepthColorBuffer.surface.image );
 	free( gx2ContextState );
 	free( commandBufferPool );
 	gx2Initialized = false;
@@ -275,8 +288,8 @@ void GLimp_SwapBuffers( void ) {
 		return;
 	}
 	if ( gx2Foreground ) {
-		if ( r_gx2Test.GetBool() ) {
-			GX2GL_DrawTestPattern();
+		if ( r_gx2Test.GetInteger() ) {
+			GX2GL_DrawTestPattern( r_gx2Test.GetInteger() );
 		}
 		static int frameNum;
 		if ( ++frameNum == r_gx2DumpFrame.GetInteger() ) {

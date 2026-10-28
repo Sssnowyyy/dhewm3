@@ -279,6 +279,7 @@ static gx2Shader_t *			ffShader;
 
 // bound to samplers that have no (valid) texture
 static GLuint					whiteTexture2D, whiteTextureCube;
+static GLuint					lastDepthTexture;	// debug: last depth texture copied to
 
 static struct {
 	int				draws, programDraws, skippedPrograms, skippedOther, uploads;
@@ -673,7 +674,9 @@ static void ApplyRenderState( void ) {
 		TRUE, BlendFactor( gl.blendSrc ), BlendFactor( gl.blendDst ), BlendEquation( gl.blendEquation ) );
 	GX2SetColorControl( GX2_LOGIC_OP_COPY, gl.blend ? 1 : 0, FALSE, TRUE );
 	uint32_t mask = ( gl.colorMask[0] ? 1 : 0 ) | ( gl.colorMask[1] ? 2 : 0 ) | ( gl.colorMask[2] ? 4 : 0 ) | ( gl.colorMask[3] ? 8 : 0 );
-	GX2SetTargetChannelMasks( (GX2ChannelMask)mask, (GX2ChannelMask)0, (GX2ChannelMask)0, (GX2ChannelMask)0,
+	// render target 1 mirrors the depth buffer: only written by draws that write depth
+	GX2ChannelMask depthMask = ( gl.depthTest && gl.depthMask ) ? GX2_CHANNEL_MASK_RGBA : (GX2ChannelMask)0;
+	GX2SetTargetChannelMasks( (GX2ChannelMask)mask, depthMask, (GX2ChannelMask)0, (GX2ChannelMask)0,
 		(GX2ChannelMask)0, (GX2ChannelMask)0, (GX2ChannelMask)0, (GX2ChannelMask)0 );
 	GX2SetAlphaTest( gl.alphaTest, CompareFunc( gl.alphaFunc ), gl.alphaRef );
 
@@ -1399,6 +1402,10 @@ void APIENTRY glClear( GLbitfield mask ) {
 	if ( flags ) {
 		GX2ClearDepthStencilEx( &gx2DepthBuffer, gl.clearDepth, gl.clearStencil, (GX2ClearFlags)flags );
 	}
+	if ( mask & GL_DEPTH_BUFFER_BIT ) {
+		// packed depth (see PackDepth() in the shaders), all ones decodes to >= 1
+		GX2ClearColor( &gx2DepthColorBuffer, 1.0f, 1.0f, 1.0f, 1.0f );
+	}
 	GX2GL_RestoreState();
 }
 
@@ -1567,8 +1574,16 @@ static int CubeFace( GLenum target ) {
 	return -1;
 }
 
+static bool IsDepthFormat( GLenum internalFormat ) {
+	return internalFormat == GL_DEPTH_COMPONENT || internalFormat == GL_DEPTH_COMPONENT16_ARB
+		|| internalFormat == GL_DEPTH_COMPONENT24_ARB || internalFormat == GL_DEPTH_COMPONENT32_ARB;
+}
+
 static uint32_t CompMap( GLenum internalFormat ) {
 	switch ( internalFormat ) {
+		case GL_DEPTH_COMPONENT: case GL_DEPTH_COMPONENT16_ARB: case GL_DEPTH_COMPONENT24_ARB: case GL_DEPTH_COMPONENT32_ARB:
+			// packed into RGBA, shaders reading depth textures unpack it
+			return GX2_COMP_MAP( GX2_SQ_SEL_R, GX2_SQ_SEL_G, GX2_SQ_SEL_B, GX2_SQ_SEL_A );
 		case GL_ALPHA: case GL_ALPHA8:
 			return GX2_COMP_MAP( GX2_SQ_SEL_0, GX2_SQ_SEL_0, GX2_SQ_SEL_0, GX2_SQ_SEL_A );
 		case GL_LUMINANCE: case GL_LUMINANCE8: case 1:
@@ -1593,8 +1608,9 @@ static void AllocTexture( glTexture_t *t, bool cube, int width, int height, GLen
 		DeferredFree( t->tex.surface.image );
 	}
 
+	bool depth = IsDepthFormat( internalFormat );
 	int levels = 1;
-	while ( ( width >> levels ) > 0 || ( height >> levels ) > 0 ) {
+	while ( !depth && ( ( width >> levels ) > 0 || ( height >> levels ) > 0 ) ) {
 		levels++;
 	}
 
@@ -1605,6 +1621,7 @@ static void AllocTexture( glTexture_t *t, bool cube, int width, int height, GLen
 	tex.surface.height = height;
 	tex.surface.depth = cube ? 6 : 1;
 	tex.surface.mipLevels = levels;
+	// depth textures get copies of gx2DepthColorBuffer, so they hold packed depth too
 	tex.surface.format = GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8;
 	tex.surface.aa = GX2_AA_MODE1X;
 	tex.surface.use = GX2_SURFACE_USE_TEXTURE;
@@ -1716,7 +1733,17 @@ void APIENTRY glTexImage2D( GLenum target, GLint level, GLint internalFormat, GL
 							GLint border, GLenum format, GLenum type, const GLvoid *pixels ) {
 	int face = CubeFace( target );
 	glTexture_t *t = BoundTexture( gl.activeUnit, face >= 0 ? GL_TEXTURE_CUBE_MAP_EXT : GL_TEXTURE_2D );
-	if ( !t || width <= 0 || height <= 0 || type != GL_UNSIGNED_BYTE ) {
+	if ( !t || width <= 0 || height <= 0 || ( type != GL_UNSIGNED_BYTE && !IsDepthFormat( internalFormat ) ) ) {
+		return;
+	}
+	if ( IsDepthFormat( internalFormat ) ) {
+		// only allocated here, filled with glCopyTexSubImage2D(). Always as big as the
+		// screen, no matter what the renderer asked for (usually the next power of
+		// two), so it can be copied in directly. Shaders using it must not depend on
+		// the requested size (see soft_particle.frag)
+		if ( level == 0 ) {
+			AllocTexture( t, false, gx2DepthBuffer.surface.width, gx2DepthBuffer.surface.height, internalFormat );
+		}
 		return;
 	}
 	if ( level == 0 && ( face <= 0 ) ) {
@@ -1738,16 +1765,28 @@ void APIENTRY glTexSubImage2D( GLenum target, GLint level, GLint xoffset, GLint 
 	UploadLevel( t, level, face, xoffset, yoffset, width, height, format, pixels );
 }
 
-// copies from the framebuffer (bottom-left origin) into a texture
+// copies from the framebuffer (bottom-left origin) into a texture,
+// from the depth buffer for depth textures
 static void CopyFramebuffer( glTexture_t *t, int xoffset, int yoffset, int x, int y, int width, int height ) {
 	if ( !gx2Foreground ) {
 		return;
 	}
 	GX2Rect rect = { x, FlipY( y, height ), x + width, FlipY( y, height ) + height };
 	GX2Point point = { xoffset, yoffset };
-	GX2CopySurfaceEx( &gx2ColorBuffer.surface, 0, 0, &t->tex.surface, 0, 0, 1, &rect, &point );
+	if ( IsDepthFormat( t->internalFormat ) ) {
+		if ( lastDepthTexture != gl.units[gl.activeUnit].bound2D ) {
+			lastDepthTexture = gl.units[gl.activeUnit].bound2D;
+			common->Printf( "GX2GL: capturing depth into texture %u (%ux%u)\n", lastDepthTexture, t->tex.surface.width, t->tex.surface.height );
+		}
+		// render target 1 mirrors the depth buffer (sampling depth buffer formats or
+		// render targets directly didn't work in Cemu), the texture has the same size
+		GX2CopySurfaceEx( &gx2DepthColorBuffer.surface, 0, 0, &t->tex.surface, 0, 0, 1, &rect, &point );
+	} else {
+		GX2CopySurfaceEx( &gx2ColorBuffer.surface, 0, 0, &t->tex.surface, 0, 0, 1, &rect, &point );
+	}
 	GX2GL_RestoreState();
-	GX2Invalidate( GX2_INVALIDATE_MODE_TEXTURE, t->tex.surface.image, t->tex.surface.imageSize );
+	// NOTE: no GX2_INVALIDATE_MODE_TEXTURE here, Cemu takes that as "reload the texture
+	// from memory", which throws away what the GPU just wrote (it's never written back)
 }
 
 void APIENTRY glCopyTexImage2D( GLenum target, GLint level, GLenum internalFormat, GLint x, GLint y, GLsizei width, GLsizei height, GLint border ) {
@@ -1978,7 +2017,42 @@ static const extProc_t extProcs[] = {
 // debug: clears the screen and draws a few known triangles through the GL emulation:
 // a red one in the middle pointing up, green and blue ones in the top left and
 // bottom right corners (through a GUI style 640x480 ortho matrix)
-void GX2GL_DrawTestPattern( void ) {
+void GX2GL_DrawTestPattern( int mode ) {
+	if ( mode == 2 || mode == 3 ) {
+		// show the last captured depth texture (packed, red is the coarse depth),
+		// 3: a white texture, to test this
+		GLuint name = mode == 3 ? whiteTexture2D : lastDepthTexture;
+		static int printed;
+		if ( !printed++ ) {
+			glTexture_t *t = ( name > 0 && (int)name < textures.Num() ) ? textures[name] : NULL;
+			common->Printf( "GX2GL test: texture %u, %s, %ux%u, format 0x%x, internal 0x%x\n", name,
+				t && t->allocated ? "allocated" : "NOT allocated", t ? t->tex.surface.width : 0, t ? t->tex.surface.height : 0,
+				t ? t->tex.surface.format : 0, t ? t->internalFormat : 0 );
+		}
+		glDisable( GL_DEPTH_TEST );
+		glDisable( GL_BLEND );
+		glDisable( GL_CULL_FACE );
+		glDisable( GL_SCISSOR_TEST );
+		glDisable( GL_ALPHA_TEST );
+		gl.vertexProgram = gl.fragmentProgram = false;
+		glViewport( 0, 0, gx2ColorBuffer.surface.width, gx2ColorBuffer.surface.height );
+		glMatrixMode( GL_PROJECTION );
+		glLoadIdentity();
+		glMatrixMode( GL_MODELVIEW );
+		glLoadIdentity();
+		gx2_glActiveTextureARB( GL_TEXTURE0_ARB );
+		glBindTexture( GL_TEXTURE_2D, name );
+		glEnable( GL_TEXTURE_2D );
+		glTexEnvi( GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE );
+		glBegin( GL_QUADS );
+		glTexCoord2f( 0, 1 ); glVertex2f( -1, -1 );
+		glTexCoord2f( 1, 1 ); glVertex2f( 1, -1 );
+		glTexCoord2f( 1, 0 ); glVertex2f( 1, 1 );
+		glTexCoord2f( 0, 0 ); glVertex2f( -1, 1 );
+		glEnd();
+		glDisable( GL_TEXTURE_2D );
+		return;
+	}
 	GX2ClearColor( &gx2ColorBuffer, 0.1f, 0.1f, 0.4f, 1.0f );
 	GX2GL_RestoreState();
 	glDisable( GL_DEPTH_TEST );

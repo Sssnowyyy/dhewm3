@@ -268,7 +268,11 @@ Sys_CreateThread
 void Sys_CreateThread(xthread_t function, void *parms, xthreadInfo& info, const char *name) {
 	Sys_EnterCriticalSection();
 
-#if SDL_VERSION_ATLEAST(2, 0, 0)
+#if defined(__WIIU__)
+	// SDL's default thread stack on the Wii U is only 32KB, the async thread's
+	// sound mixing alone has bigger buffers than that on the stack
+	SDL_Thread *t = SDL_CreateThreadWithStackSize(function, name, 2 * 1024 * 1024, parms);
+#elif SDL_VERSION_ATLEAST(2, 0, 0)
 	SDL_Thread *t = SDL_CreateThread(function, name, parms);
 #else
 	SDL_Thread *t = SDL_CreateThread(function, parms);

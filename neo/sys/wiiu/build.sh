@@ -32,6 +32,6 @@ fi
 cmake --build build-wiiu -j"$(sysctl -n hw.ncpu 2>/dev/null || nproc)"
 
 echo
-echo "Built: build-wiiu/dhewm3.rpx"
-echo "Copy it to sd:/wiiu/apps/dhewm3/, put your Doom 3 base/*.pk4 files (patched to 1.3.1)"
+echo "Built: build-wiiu/dhewm3.rpx and build-wiiu/dhewm3.wuhb (for the Wii U menu with Aroma)"
+echo "Copy one of them to sd:/wiiu/apps/dhewm3/, put your Doom 3 base/*.pk4 files (patched to 1.3.1)"
 echo "and base/gamepad.cfg from this repo in sd:/wiiu/apps/dhewm3/base/"

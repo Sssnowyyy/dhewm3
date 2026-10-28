@@ -39,6 +39,10 @@ If you have questions concerning this license or the applicable additional terms
 // and the GamePad scan buffers when the frame is done
 extern GX2ColorBuffer	gx2ColorBuffer;
 extern GX2DepthBuffer	gx2DepthBuffer;
+// render target 1: every draw that writes depth also writes it here (packed into
+// RGBA8 by the shaders), so it can be copied into depth textures. Converting the
+// depth buffer, sampling render targets and float formats all read as zeros in Cemu
+extern GX2ColorBuffer	gx2DepthColorBuffer;
 extern GX2ContextState*	gx2ContextState;
 extern bool				gx2Foreground;	// false while the HOME menu owns the GPU
 
@@ -54,6 +58,6 @@ void	GX2GL_EndFrame( void );
 // expanded attributes, texture upload staging), valid until GX2GL_EndFrame()
 void *	GX2GL_FrameAlloc( size_t size, size_t align = 64 );
 
-void	GX2GL_DrawTestPattern( void );
+void	GX2GL_DrawTestPattern( int mode );
 
 #endif

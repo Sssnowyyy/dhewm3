@@ -210,7 +210,7 @@ endif()
 
 # libs
 if(WIIU)
-	# no OpenAL implementation on Wii U yet - just its headers, for sys/stub/openal_stub.cpp
+	# OpenAL is implemented in sys/wiiu/wiiu_openal.cpp, only the headers are needed
 	include_directories("${CMAKE_SOURCE_DIR}/sys/wiiu/include")
 	set(OPENAL_LIBRARY "")
 else()
@@ -1226,13 +1226,13 @@ if(WIIU)
 	)
 
 	# OpenGL on top of GX2; stub_gl.cpp's weak definitions cover the GL functions
-	# it doesn't implement. TODO: a real sound backend
+	# it doesn't implement. OpenAL is a small software mixer on top of SDL2 audio
 	# GLSL shaders, compiled with CafeGLSL (https://github.com/Exzap/CafeGLSL) and embedded
 	set(WIIU_GLSLCOMPILER "${CMAKE_BINARY_DIR}/tools/cafeglsl/bin/glslcompiler" CACHE FILEPATH "CafeGLSL's glslcompiler")
 	if(NOT EXISTS "${WIIU_GLSLCOMPILER}")
 		message(FATAL_ERROR "CafeGLSL's glslcompiler not found at ${WIIU_GLSLCOMPILER} (sys/wiiu/build.sh downloads it), set WIIU_GLSLCOMPILER")
 	endif()
-	set(wiiu_shader_names ff interaction shadow environment bumpyEnvironment heatHaze heatHazeWithMask heatHazeWithMaskAndVertex colorProcess)
+	set(wiiu_shader_names ff interaction shadow environment bumpyEnvironment heatHaze heatHazeWithMask heatHazeWithMaskAndVertex colorProcess soft_particle)
 	set(wiiu_shader_dir "${CMAKE_SOURCE_DIR}/sys/wiiu/shaders")
 	set(wiiu_gsh_files "")
 	foreach(name ${wiiu_shader_names})
@@ -1258,8 +1258,8 @@ if(WIIU)
 	set(src_sys_core
 		sys/wiiu/gx2_gl.cpp
 		sys/wiiu/gx2_glimp.cpp
+		sys/wiiu/wiiu_openal.cpp
 		${src_stub_gl}
-		${src_stub_openal}
 	)
 elseif(AROS)
 	set(DHEWM3BINARY "ADoom3")
@@ -1433,6 +1433,8 @@ endif()
 	if(WIIU)
 		target_sources(${DHEWM3BINARY} PRIVATE ${wiiu_generated_sources})
 		wut_create_rpx(${DHEWM3BINARY})
+		# bundle for Aroma's Wii U menu integration
+		wut_create_wuhb(${DHEWM3BINARY} NAME "Doom 3" SHORTNAME "Doom 3" AUTHOR "id Software, dhewm3")
 	endif()
 
 	if(NOT APPLE AND NOT WIN32)

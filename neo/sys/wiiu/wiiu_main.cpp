@@ -382,8 +382,6 @@ static int EngineThreadMain( int argc, const char **argv ) {
 		"+set", "r_customWidth", "1280",
 		"+set", "r_customHeight", "720",
 		"+set", "r_fullscreen", "1",
-		// needs a depth texture and its own shader port, TODO
-		"+set", "r_useSoftParticles", "0",
 	};
 	static char *args[64];
 	int numArgs = 0;
