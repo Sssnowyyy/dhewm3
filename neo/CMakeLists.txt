@@ -1260,6 +1260,7 @@ if(WIIU)
 		sys/wiiu/gx2_glimp.cpp
 		sys/wiiu/wiiu_openal.cpp
 		sys/wiiu/wiiu_keyboard.cpp
+		sys/wiiu/wiiu_pk4io.cpp
 		${src_stub_gl}
 	)
 elseif(AROS)

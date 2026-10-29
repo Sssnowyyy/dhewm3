@@ -1612,6 +1612,7 @@ void idSessionLocal::ExecuteMapChange( bool noFadeWipe ) {
 #ifdef __WIIU__
 	memset( loadMarks, 0, sizeof( loadMarks ) );
 	memset( &wiiuLoadProfile, 0, sizeof( wiiuLoadProfile ) );
+	Wiiu_PrintMemory( "before loading" );
 #endif
 	LOAD_MARK( LOAD_START );
 
@@ -1669,6 +1670,9 @@ void idSessionLocal::ExecuteMapChange( bool noFadeWipe ) {
 		common->Error( "couldn't load %s", fullMapName.c_str() );
 	}
 	LOAD_MARK( LOAD_GEOMETRY );
+#ifdef __WIIU__
+	Wiiu_PrintMemory( "after loading the level geometry" );
+#endif
 
 	// for the synchronous networking we needed to roll the angles over from
 	// level to level, but now we can just clear everything
@@ -1746,10 +1750,11 @@ void idSessionLocal::ExecuteMapChange( bool noFadeWipe ) {
 		( loadMarks[LOAD_SETTLED] - loadMarks[LOAD_START] ) / 1000.0 );
 	#undef LOAD_PHASE
 	const wiiuLoadProfile_t &lp = wiiuLoadProfile;
-	common->Printf( "Load totals (s, across phases): drive reads %.1f | .pk4 reads incl. decompression %.1f | sounds %.1f"
-		" (decoding %d .ogg: %.1f) | models %.1f | images %.1f\n",
-		lp.driveReadMs / 1000.0, lp.pk4ReadMs / 1000.0, lp.soundMs / 1000.0, lp.decodedSounds, lp.soundDecodeMs / 1000.0,
-		lp.modelMs / 1000.0, lp.imageMs / 1000.0 );
+	common->Printf( "Load totals (s, across phases): drive reads %.1f (%d reads, %.0f MB) | .pk4 reads incl. decompression %.1f"
+		" (%d files) | sounds %.1f (decoding %d .ogg: %.1f) | models %.1f | images %.1f | %d lookups in base/ skipped\n",
+		lp.driveReadMs / 1000.0, lp.driveReads, lp.driveReadBytes / ( 1024.0 * 1024.0 ), lp.pk4ReadMs / 1000.0, lp.pk4Opens,
+		lp.soundMs / 1000.0, lp.decodedSounds, lp.soundDecodeMs / 1000.0, lp.modelMs / 1000.0, lp.imageMs / 1000.0, lp.skippedLookups );
+	Wiiu_PrintMemory( "after loading" );
 #endif
 
 	// let the renderSystem generate interactions now that everything is spawned

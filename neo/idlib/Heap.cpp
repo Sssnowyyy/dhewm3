@@ -31,6 +31,10 @@ If you have questions concerning this license or the applicable additional terms
 
 #include "idlib/Heap.h"
 
+#ifdef __WIIU__
+#include "sys/wiiu/wiiu_loadprofile.h"
+#endif
+
 #ifndef USE_LIBC_MALLOC
 	#define USE_LIBC_MALLOC		0
 #endif
@@ -332,6 +336,9 @@ void *idHeap::Allocate16( const dword bytes ) {
 			AllocDefragBlock();
 		}
 		if ( !ptr ) {
+#ifdef __WIIU__
+			Wiiu_PrintMemory( "when it ran out" );
+#endif
 			common->FatalError( "malloc failure for %i", bytes );
 		}
 	}
@@ -487,7 +494,10 @@ idHeap::page_s* idHeap::AllocatePage( dword bytes ) {
 				AllocDefragBlock();
 			}
 			if ( !p ) {
-				common->FatalError( "malloc failure for %i", bytes );
+	#ifdef __WIIU__
+			Wiiu_PrintMemory( "when it ran out" );
+#endif
+			common->FatalError( "malloc failure for %i", bytes );
 			}
 		}
 

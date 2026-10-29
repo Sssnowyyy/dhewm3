@@ -50,6 +50,7 @@ If you have questions concerning this license or the applicable additional terms
 extern idCVar com_speeds;
 
 #include "sys/wiiu/gx2_local.h"
+#include "sys/wiiu/wiiu_loadprofile.h"
 #include "sys/wiiu/wiiu_keyboard.h"
 
 GX2ColorBuffer		gx2ColorBuffer;
@@ -395,9 +396,9 @@ static void ProfileFrame( double gpuWaitMs, int draws ) {
 	double elapsed = now - prof.periodStart;
 	if ( elapsed >= interval * 1000.0 && prof.frames > 0 ) {
 		float n = prof.frames;
-		common->Printf( "Wii U perf: %.1f fps | frame avg %.1f ms, worst %.0f ms | game %.1f, render frontend %.1f, backend %.1f, GPU wait %.1f ms | %.0f draws\n",
+		common->Printf( "Wii U perf: %.1f fps | frame avg %.1f ms, worst %.0f ms | game %.1f, render frontend %.1f, backend %.1f, GPU wait %.1f ms | %.0f draws | %d MB in use\n",
 			prof.frames * 1000.0 / elapsed, prof.frameMs / n, prof.worstFrameMs,
-			prof.gameMs / n, prof.frontendMs / n, prof.backendMs / n, prof.gpuWaitMs / n, prof.draws / n );
+			prof.gameMs / n, prof.frontendMs / n, prof.backendMs / n, prof.gpuWaitMs / n, prof.draws / n, Wiiu_MemoryUsedMB() );
 		double last = prof.lastSwap;
 		memset( &prof, 0, sizeof( prof ) );
 		prof.lastSwap = last;

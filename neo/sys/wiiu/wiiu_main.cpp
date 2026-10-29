@@ -60,12 +60,79 @@ If you have questions concerning this license or the applicable additional terms
 
 wiiuLoadProfile_t wiiuLoadProfile;
 
-extern "C" double Wiiu_Milliseconds( void ) {
-	return Sys_MillisecondsPrecise();
+
+/*
+The directories under WIIU_DATA_PATH. The engine looks for every file it loads in
+base/ before it looks into the .pk4s, and on the Wii U that's a few filesystem
+calls (each a request to IOSU and the SD card / USB drive) even if the file isn't
+there - thousands of them per level load. Nearly all game files live in
+directories that don't exist outside the .pk4s, so remember which do exist and
+skip the lookup otherwise. FAT ignores case, so they're compared without.
+*/
+#define MAX_KNOWN_DIRS 256
+static char		knownDirs[MAX_KNOWN_DIRS][MAX_OSPATH];
+static int		numKnownDirs = -1;
+
+static void AddKnownDir( const char *path ) {
+	int len = strlen( path );
+	while ( len > 0 && path[len-1] == '/' ) {
+		len--;
+	}
+	if ( len >= MAX_OSPATH ) {
+		return;
+	}
+	for ( int i = 0; i < numKnownDirs; i++ ) {
+		if ( idStr::Icmpn( knownDirs[i], path, len ) == 0 && knownDirs[i][len] == '\0' ) {
+			return;
+		}
+	}
+	if ( numKnownDirs >= MAX_KNOWN_DIRS ) {
+		numKnownDirs = MAX_KNOWN_DIRS + 1;	// too many, give up on skipping lookups
+		return;
+	}
+	memcpy( knownDirs[numKnownDirs], path, len );
+	knownDirs[numKnownDirs][len] = '\0';
+	numKnownDirs++;		// after the entry is written, readers may be on other threads
 }
 
-extern "C" void Wiiu_AddDriveReadTime( double ms ) {
-	wiiuLoadProfile.driveReadMs += ms;
+static void ScanKnownDirs( const char *path, int depth ) {
+	AddKnownDir( path );
+	DIR *dir = opendir( path );
+	if ( !dir || depth > 8 ) {
+		if ( dir ) {
+			closedir( dir );
+		}
+		return;
+	}
+	struct dirent *d;
+	while ( ( d = readdir( dir ) ) != NULL ) {
+		if ( d->d_type != DT_DIR || d->d_name[0] == '.' ) {
+			continue;
+		}
+		idStr sub = va( "%s/%s", path, d->d_name );
+		ScanKnownDirs( sub.c_str(), depth + 1 );
+	}
+	closedir( dir );
+}
+
+// false if the file can't exist because its directory doesn't
+bool Wiiu_FileMayExist( const char *path ) {
+	if ( numKnownDirs < 0 ) {
+		numKnownDirs = 0;
+		ScanKnownDirs( WIIU_DATA_PATH, 0 );
+	}
+	if ( numKnownDirs > MAX_KNOWN_DIRS || idStr::Icmpn( path, WIIU_DATA_PATH "/", strlen( WIIU_DATA_PATH ) + 1 ) != 0 ) {
+		return true;
+	}
+	const char *slash = strrchr( path, '/' );
+	int len = slash - path;
+	for ( int i = 0; i < numKnownDirs; i++ ) {
+		if ( idStr::Icmpn( knownDirs[i], path, len ) == 0 && knownDirs[i][len] == '\0' ) {
+			return true;
+		}
+	}
+	wiiuLoadProfile.skippedLookups++;
+	return false;
 }
 
 idCVar com_pid( "com_pid", "0", CVAR_INTEGER | CVAR_INIT | CVAR_SYSTEM, "process id" );
@@ -137,6 +204,9 @@ void Sys_Quit( void ) {
 
 void Sys_Mkdir( const char *path ) {
 	mkdir( path, 0777 );
+	if ( numKnownDirs >= 0 ) {
+		AddKnownDir( path );
+	}
 }
 
 int Sys_ListFiles( const char *directory, const char *extension, idStrList &list ) {
@@ -233,6 +303,32 @@ int Sys_GetSystemRam( void ) {
 	int mb = (int)( size / ( 1024 * 1024 ) );
 	// round to the nearest 16Mb
 	return ( mb + 8 ) & ~15;
+}
+
+// the biggest single allocation malloc() can still satisfy (a binary search with
+// test allocations, so only call this now and then)
+static int LargestFreeBlockMB( void ) {
+	size_t lo = 0, hi = (size_t)Max( Sys_GetSystemRam(), 1024 ) * 1024 * 1024;
+	while ( hi - lo > 256 * 1024 ) {
+		size_t mid = lo + ( hi - lo ) / 2;
+		void *p = malloc( mid );
+		if ( p ) {
+			free( p );
+			lo = mid;
+		} else {
+			hi = mid;
+		}
+	}
+	return (int)( lo / ( 1024 * 1024 ) );
+}
+
+int Wiiu_MemoryUsedMB( void ) {
+	return (int)( mallinfo().uordblks / ( 1024 * 1024 ) );
+}
+
+void Wiiu_PrintMemory( const char *when ) {
+	common->Printf( "Wii U memory %s: %d MB in use, largest free block %d MB\n",
+		when, Wiiu_MemoryUsedMB(), LargestFreeBlockMB() );
 }
 
 // everything is hardlinked (HARDLINK_GAME), there are no game DLLs to load

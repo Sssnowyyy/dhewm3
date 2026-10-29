@@ -87,6 +87,7 @@ idCVar r_gx2Debug( "r_gx2Debug", "0", CVAR_RENDERER | CVAR_INTEGER, "print GX2 G
 #define FRAME_ARENA_SIZE	( 16 * 1024 * 1024 )
 #define NUM_FRAME_SLOTS		2
 
+idCVar r_gx2StateCache( "r_gx2StateCache", "1", CVAR_RENDERER | CVAR_BOOL, "only send render state, shaders and textures to the GPU when they change" );
 idCVar r_gx2Pipeline( "r_gx2Pipeline", "1", CVAR_RENDERER | CVAR_BOOL, "let the CPU prepare the next frame while the GPU draws the last one (0: wait for the GPU every frame)" );
 
 // Per-frame memory is double buffered, so the CPU can work on the next frame while
@@ -192,7 +193,9 @@ struct glTexture_t {
 	float			maxAniso;
 	GX2Sampler		sampler;
 	bool			samplerDirty;
+	uint32_t		bindVersion;	// changes whenever the texture or sampler registers do
 };
+static uint32_t bindVersionCounter;
 
 // ARB programs are bound by the renderer's program_t idents, without glGenProgramsARB()
 #define MAX_PROGRAM_IDENTS	512
@@ -667,7 +670,54 @@ void GX2GL_Shutdown( void ) {
 	frameArena = NULL;
 }
 
+/*
+What was last sent to the GPU, so draws only send what changed. Forgotten when
+something else may have changed the registers (clears, copies, the keyboard...).
+*/
+struct depthStencilState_t {
+	int		depthTest, depthWrite, depthFunc, stencilTest, twoSided, stencilFunc, ops[6], funcMask, writeMask, ref;
+};
+struct blendState_t {
+	int		src, dst, equation, blend, colorMask, depthMask, alphaTest, alphaFunc;
+	float	alphaRef;
+};
+struct rasterState_t {
+	int		frontFace, cullFront, cullBack, offsetFill;
+	float	offsetUnits, offsetFactor;
+};
+struct viewState_t {
+	float	viewport[4], depthNear, depthFar;
+	int		scissor[4];
+};
+#define MAX_PIXEL_SAMPLERS 16
+static struct {
+	bool					valid;
+	depthStencilState_t		depthStencil;
+	blendState_t			blend;
+	rasterState_t			raster;
+	viewState_t				view;
+	GX2FetchShader *		fetchShader;
+	GX2VertexShader *		vertexShader;
+	GX2PixelShader *		pixelShader;
+	glTexture_t *			texture[MAX_PIXEL_SAMPLERS];
+	uint32_t				textureVersion[MAX_PIXEL_SAMPLERS];
+} applied;
+
+static void InvalidateStateCache( void ) {
+	memset( &applied, 0, sizeof( applied ) );
+}
+
+// true if the state differs from what was sent last, which is then updated
+template<class T> static bool StateChanged( T &last, const T &now ) {
+	if ( applied.valid && memcmp( &last, &now, sizeof( T ) ) == 0 ) {
+		return false;
+	}
+	last = now;
+	return true;
+}
+
 void GX2GL_RestoreState( void ) {
+	InvalidateStateCache();
 	GX2SetContextState( gx2ContextState );
 	GX2SetShaderMode( GX2_SHADER_MODE_UNIFORM_REGISTER );
 }
@@ -714,49 +764,102 @@ void GX2GL_EndFrame( OSTime submitted ) {
 */
 
 static void ApplyRenderState( void ) {
-	// depth / stencil
-	GLenum sf = gl.stencilFunc;
-	bool twoSided = gl.stencilFail[0] != gl.stencilFail[1] || gl.stencilZFail[0] != gl.stencilZFail[1] || gl.stencilZPass[0] != gl.stencilZPass[1];
-	GLenum depthFunc = gl.depthFunc;
-	if ( depthFunc == GL_EQUAL && r_gx2DepthEqualAsLequal.GetBool() ) {
-		depthFunc = GL_LEQUAL;
+	if ( !r_gx2StateCache.GetBool() ) {
+		InvalidateStateCache();
 	}
-	GX2SetDepthStencilControl( gl.depthTest, gl.depthTest && gl.depthMask, CompareFunc( depthFunc ),
-		gl.stencilTest, twoSided,
-		CompareFunc( sf ), StencilOp( gl.stencilZPass[0] ), StencilOp( gl.stencilZFail[0] ), StencilOp( gl.stencilFail[0] ),
-		CompareFunc( sf ), StencilOp( gl.stencilZPass[1] ), StencilOp( gl.stencilZFail[1] ), StencilOp( gl.stencilFail[1] ) );
-	GX2SetStencilMask( gl.stencilFuncMask, gl.stencilWriteMask, gl.stencilRef, gl.stencilFuncMask, gl.stencilWriteMask, gl.stencilRef );
+
+	// depth / stencil
+	depthStencilState_t ds;
+	memset( &ds, 0, sizeof( ds ) );
+	ds.depthTest = gl.depthTest;
+	ds.depthWrite = gl.depthTest && gl.depthMask;
+	ds.depthFunc = gl.depthFunc;
+	if ( ds.depthFunc == GL_EQUAL && r_gx2DepthEqualAsLequal.GetBool() ) {
+		ds.depthFunc = GL_LEQUAL;
+	}
+	ds.stencilTest = gl.stencilTest;
+	ds.twoSided = gl.stencilFail[0] != gl.stencilFail[1] || gl.stencilZFail[0] != gl.stencilZFail[1] || gl.stencilZPass[0] != gl.stencilZPass[1];
+	ds.stencilFunc = gl.stencilFunc;
+	for ( int i = 0; i < 2; i++ ) {
+		ds.ops[i*3+0] = gl.stencilZPass[i];
+		ds.ops[i*3+1] = gl.stencilZFail[i];
+		ds.ops[i*3+2] = gl.stencilFail[i];
+	}
+	ds.funcMask = gl.stencilFuncMask;
+	ds.writeMask = gl.stencilWriteMask;
+	ds.ref = gl.stencilRef;
+	if ( StateChanged( applied.depthStencil, ds ) ) {
+		GX2SetDepthStencilControl( ds.depthTest, ds.depthWrite, CompareFunc( ds.depthFunc ),
+			ds.stencilTest, ds.twoSided,
+			CompareFunc( ds.stencilFunc ), StencilOp( ds.ops[0] ), StencilOp( ds.ops[1] ), StencilOp( ds.ops[2] ),
+			CompareFunc( ds.stencilFunc ), StencilOp( ds.ops[3] ), StencilOp( ds.ops[4] ), StencilOp( ds.ops[5] ) );
+		GX2SetStencilMask( ds.funcMask, ds.writeMask, ds.ref, ds.funcMask, ds.writeMask, ds.ref );
+	}
 
 	// blending
-	GX2SetBlendControl( GX2_RENDER_TARGET_0, BlendFactor( gl.blendSrc ), BlendFactor( gl.blendDst ), BlendEquation( gl.blendEquation ),
-		TRUE, BlendFactor( gl.blendSrc ), BlendFactor( gl.blendDst ), BlendEquation( gl.blendEquation ) );
-	GX2SetColorControl( GX2_LOGIC_OP_COPY, gl.blend ? 1 : 0, FALSE, TRUE );
-	uint32_t mask = ( gl.colorMask[0] ? 1 : 0 ) | ( gl.colorMask[1] ? 2 : 0 ) | ( gl.colorMask[2] ? 4 : 0 ) | ( gl.colorMask[3] ? 8 : 0 );
+	blendState_t bs;
+	memset( &bs, 0, sizeof( bs ) );
+	bs.src = gl.blendSrc;
+	bs.dst = gl.blendDst;
+	bs.equation = gl.blendEquation;
+	bs.blend = gl.blend;
+	bs.colorMask = ( gl.colorMask[0] ? 1 : 0 ) | ( gl.colorMask[1] ? 2 : 0 ) | ( gl.colorMask[2] ? 4 : 0 ) | ( gl.colorMask[3] ? 8 : 0 );
 	// render target 1 mirrors the depth buffer: only written by draws that write depth
-	GX2ChannelMask depthMask = ( gl.depthTest && gl.depthMask ) ? GX2_CHANNEL_MASK_RGBA : (GX2ChannelMask)0;
-	GX2SetTargetChannelMasks( (GX2ChannelMask)mask, depthMask, (GX2ChannelMask)0, (GX2ChannelMask)0,
-		(GX2ChannelMask)0, (GX2ChannelMask)0, (GX2ChannelMask)0, (GX2ChannelMask)0 );
-	GX2SetAlphaTest( gl.alphaTest, CompareFunc( gl.alphaFunc ), gl.alphaRef );
-
-	// rasterizer
-	bool cullFront = gl.cullFace && ( gl.cullMode == GL_FRONT || gl.cullMode == GL_FRONT_AND_BACK );
-	bool cullBack = gl.cullFace && ( gl.cullMode == GL_BACK || gl.cullMode == GL_FRONT_AND_BACK );
-	GX2SetPolygonControl( gl.frontFace == GL_CW ? GX2_FRONT_FACE_CW : GX2_FRONT_FACE_CCW, cullFront, cullBack,
-		FALSE, GX2_POLYGON_MODE_TRIANGLE, GX2_POLYGON_MODE_TRIANGLE,
-		gl.polygonOffsetFill, gl.polygonOffsetFill, FALSE );
-	if ( gl.polygonOffsetFill ) {
-		GX2SetPolygonOffset( gl.polyOffsetUnits, gl.polyOffsetFactor, gl.polyOffsetUnits, gl.polyOffsetFactor, 0.0f );
+	bs.depthMask = ( gl.depthTest && gl.depthMask ) ? GX2_CHANNEL_MASK_RGBA : 0;
+	bs.alphaTest = gl.alphaTest;
+	bs.alphaFunc = gl.alphaFunc;
+	bs.alphaRef = gl.alphaRef;
+	if ( StateChanged( applied.blend, bs ) ) {
+		GX2SetBlendControl( GX2_RENDER_TARGET_0, BlendFactor( bs.src ), BlendFactor( bs.dst ), BlendEquation( bs.equation ),
+			TRUE, BlendFactor( bs.src ), BlendFactor( bs.dst ), BlendEquation( bs.equation ) );
+		GX2SetColorControl( GX2_LOGIC_OP_COPY, bs.blend ? 1 : 0, FALSE, TRUE );
+		GX2SetTargetChannelMasks( (GX2ChannelMask)bs.colorMask, (GX2ChannelMask)bs.depthMask, (GX2ChannelMask)0, (GX2ChannelMask)0,
+			(GX2ChannelMask)0, (GX2ChannelMask)0, (GX2ChannelMask)0, (GX2ChannelMask)0 );
+		GX2SetAlphaTest( bs.alphaTest, CompareFunc( bs.alphaFunc ), bs.alphaRef );
 	}
 
-	GX2SetViewport( gl.viewport[0], FlipY( gl.viewport[1], gl.viewport[3] ), gl.viewport[2], gl.viewport[3], gl.depthNear, gl.depthFar );
+	// rasterizer
+	rasterState_t rs;
+	memset( &rs, 0, sizeof( rs ) );
+	rs.frontFace = gl.frontFace;
+	rs.cullFront = gl.cullFace && ( gl.cullMode == GL_FRONT || gl.cullMode == GL_FRONT_AND_BACK );
+	rs.cullBack = gl.cullFace && ( gl.cullMode == GL_BACK || gl.cullMode == GL_FRONT_AND_BACK );
+	rs.offsetFill = gl.polygonOffsetFill;
+	if ( rs.offsetFill ) {
+		rs.offsetUnits = gl.polyOffsetUnits;
+		rs.offsetFactor = gl.polyOffsetFactor;
+	}
+	if ( StateChanged( applied.raster, rs ) ) {
+		GX2SetPolygonControl( rs.frontFace == GL_CW ? GX2_FRONT_FACE_CW : GX2_FRONT_FACE_CCW, rs.cullFront, rs.cullBack,
+			FALSE, GX2_POLYGON_MODE_TRIANGLE, GX2_POLYGON_MODE_TRIANGLE,
+			rs.offsetFill, rs.offsetFill, FALSE );
+		if ( rs.offsetFill ) {
+			GX2SetPolygonOffset( rs.offsetUnits, rs.offsetFactor, rs.offsetUnits, rs.offsetFactor, 0.0f );
+		}
+	}
+
+	viewState_t vs;
+	memset( &vs, 0, sizeof( vs ) );
+	vs.viewport[0] = gl.viewport[0];
+	vs.viewport[1] = FlipY( gl.viewport[1], gl.viewport[3] );
+	vs.viewport[2] = gl.viewport[2];
+	vs.viewport[3] = gl.viewport[3];
+	vs.depthNear = gl.depthNear;
+	vs.depthFar = gl.depthFar;
 	if ( gl.scissorTest ) {
 		int x = Max( 0, gl.scissor[0] );
 		int y = Max( 0, FlipY( gl.scissor[1], gl.scissor[3] ) );
-		int w = Min( (int)gx2ColorBuffer.surface.width - x, gl.scissor[2] );
-		int h = Min( (int)gx2ColorBuffer.surface.height - y, gl.scissor[3] );
-		GX2SetScissor( x, y, Max( 0, w ), Max( 0, h ) );
+		vs.scissor[0] = x;
+		vs.scissor[1] = y;
+		vs.scissor[2] = Max( 0, Min( (int)gx2ColorBuffer.surface.width - x, gl.scissor[2] ) );
+		vs.scissor[3] = Max( 0, Min( (int)gx2ColorBuffer.surface.height - y, gl.scissor[3] ) );
 	} else {
-		GX2SetScissor( 0, 0, gx2ColorBuffer.surface.width, gx2ColorBuffer.surface.height );
+		vs.scissor[2] = gx2ColorBuffer.surface.width;
+		vs.scissor[3] = gx2ColorBuffer.surface.height;
+	}
+	if ( StateChanged( applied.view, vs ) ) {
+		GX2SetViewport( vs.viewport[0], vs.viewport[1], vs.viewport[2], vs.viewport[3], vs.depthNear, vs.depthFar );
+		GX2SetScissor( vs.scissor[0], vs.scissor[1], vs.scissor[2], vs.scissor[3] );
 	}
 }
 
@@ -778,6 +881,14 @@ static void BindTextureSampler( glTexture_t *t, int unit ) {
 		GX2InitSamplerClamping( &t->sampler, ClampMode( t->wrapS ), ClampMode( t->wrapT ), ClampMode( wrapR ) );
 		GX2InitSamplerLOD( &t->sampler, 0.0f, mip ? (float)t->maxLevel : 0.0f, 0.0f );
 		t->samplerDirty = false;
+		t->bindVersion = ++bindVersionCounter;
+	}
+	if ( unit < MAX_PIXEL_SAMPLERS ) {
+		if ( applied.valid && applied.texture[unit] == t && applied.textureVersion[unit] == t->bindVersion ) {
+			return;
+		}
+		applied.texture[unit] = t;
+		applied.textureVersion[unit] = t->bindVersion;
 	}
 	GX2SetPixelTexture( &t->tex, unit );
 	GX2SetPixelSampler( &t->sampler, unit );
@@ -1067,9 +1178,19 @@ static void Draw( GLenum mode, const vertexSources_t &src, GLenum indexType, con
 
 	ApplyRenderState();
 
-	GX2SetFetchShader( FetchShader( sh, formats ) );
-	GX2SetVertexShader( sh->group.vertexShader );
-	GX2SetPixelShader( sh->group.pixelShader );
+	GX2FetchShader *fetchShader = FetchShader( sh, formats );
+	if ( !applied.valid || applied.fetchShader != fetchShader ) {
+		GX2SetFetchShader( fetchShader );
+		applied.fetchShader = fetchShader;
+	}
+	if ( !applied.valid || applied.vertexShader != sh->group.vertexShader ) {
+		GX2SetVertexShader( sh->group.vertexShader );
+		applied.vertexShader = sh->group.vertexShader;
+	}
+	if ( !applied.valid || applied.pixelShader != sh->group.pixelShader ) {
+		GX2SetPixelShader( sh->group.pixelShader );
+		applied.pixelShader = sh->group.pixelShader;
+	}
 
 	const float *modelView = gl.modelview.m[gl.modelview.depth];
 	const float *projection = gl.projection.m[gl.projection.depth];
@@ -1099,6 +1220,7 @@ static void Draw( GLenum mode, const vertexSources_t &src, GLenum indexType, con
 		}
 		BindTextureSampler( t, sh->samplerLocation[i] );
 	}
+	applied.valid = true;
 
 	for ( int i = 0; i < sh->numAttribs; i++ ) {
 		GX2SetAttribBuffer( i, streams[i].size, streams[i].stride, streams[i].ptr );
@@ -1708,6 +1830,7 @@ static void AllocTexture( glTexture_t *t, bool cube, int width, int height, GLen
 	tex.surface.mipmaps = tex.surface.mipmapSize ? (byte *)tex.surface.image + tex.surface.imageSize : NULL;
 
 	t->allocated = true;
+	t->bindVersion = ++bindVersionCounter;
 	t->internalFormat = internalFormat;
 	t->maxLevel = 0;
 	t->samplerDirty = true;

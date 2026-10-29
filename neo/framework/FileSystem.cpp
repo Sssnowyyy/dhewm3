@@ -49,6 +49,10 @@ If you have questions concerning this license or the applicable additional terms
 
 #include "framework/FileSystem.h"
 
+#ifdef __WIIU__
+#include "sys/wiiu/wiiu_loadprofile.h"
+#endif
+
 /*
 =============================================================================
 
@@ -478,7 +482,7 @@ idCVar	idFileSystemLocal::fs_cdpath( "fs_cdpath", "", CVAR_SYSTEM | CVAR_INIT, "
 idCVar	idFileSystemLocal::fs_devpath( "fs_devpath", "", CVAR_SYSTEM | CVAR_INIT, "" );
 idCVar	idFileSystemLocal::fs_game( "fs_game", "", CVAR_SYSTEM | CVAR_INIT | CVAR_SERVERINFO, "mod path" );
 idCVar  idFileSystemLocal::fs_game_base( "fs_game_base", "", CVAR_SYSTEM | CVAR_INIT | CVAR_SERVERINFO, "alternate mod path, searched after the main fs_game path, before the basedir" );
-#if defined(__AROS__) || defined(WIN32)
+#if defined(__AROS__) || defined(WIN32) || defined(__WIIU__) // Wii U: FAT ignores case
 idCVar	idFileSystemLocal::fs_caseSensitiveOS( "fs_caseSensitiveOS", "0", CVAR_SYSTEM | CVAR_BOOL, "" );
 #else
 idCVar	idFileSystemLocal::fs_caseSensitiveOS( "fs_caseSensitiveOS", "1", CVAR_SYSTEM | CVAR_BOOL, "" );
@@ -588,6 +592,11 @@ FILE *idFileSystemLocal::OpenOSFile( const char *fileName, const char *mode, idS
 	idStr fpath, entry;
 	idStrList list;
 
+#ifdef __WIIU__
+	if ( mode[0] == 'r' && !Wiiu_FileMayExist( fileName ) ) {
+		return NULL;
+	}
+#endif
 #ifndef WIN32
 	// some systems will let you fopen a directory
 	struct stat buf;

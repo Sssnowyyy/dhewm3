@@ -29,7 +29,8 @@
 #include "ioapi.h"
 
 #ifdef __WIIU__
-#include "sys/wiiu/wiiu_loadprofile.h"
+/* sys/wiiu/wiiu_pk4io.cpp: keeps the .pk4s open and caches reads, see there */
+void Wiiu_FillPk4FileFuncs(zlib_filefunc64_def* pzlib_filefunc_def);
 #endif
 
 voidpf call_zopen64 (const zlib_filefunc64_32_def* pfilefunc, const void*filename, int mode) {
@@ -98,10 +99,6 @@ static voidpf ZCALLBACK fopen_file_func(voidpf opaque, const char* filename, int
 
     if ((filename!=NULL) && (mode_fopen != NULL))
         file = fopen(filename, mode_fopen);
-#ifdef __WIIU__
-    if (file != NULL)
-        setvbuf(file, NULL, _IOFBF, 64 * 1024);
-#endif
     return file;
 }
 
@@ -120,12 +117,6 @@ static voidpf ZCALLBACK fopen64_file_func(voidpf opaque, const void* filename, i
 
     if ((filename!=NULL) && (mode_fopen != NULL))
         file = FOPEN_FUNC((const char*)filename, mode_fopen);
-#ifdef __WIIU__
-    /* every read is a filesystem call to the SD/USB device, which is slow,
-       and newlib only buffers 1KB by default */
-    if (file != NULL)
-        setvbuf(file, NULL, _IOFBF, 64 * 1024);
-#endif
     return file;
 }
 
@@ -133,15 +124,7 @@ static voidpf ZCALLBACK fopen64_file_func(voidpf opaque, const void* filename, i
 static uLong ZCALLBACK fread_file_func(voidpf opaque, voidpf stream, void* buf, uLong size) {
     uLong ret;
     (void)opaque;
-#ifdef __WIIU__
-    {
-        double start = Wiiu_Milliseconds();
-        ret = (uLong)fread(buf, 1, (size_t)size, (FILE *)stream);
-        Wiiu_AddDriveReadTime(Wiiu_Milliseconds() - start);
-    }
-#else
     ret = (uLong)fread(buf, 1, (size_t)size, (FILE *)stream);
-#endif
     return ret;
 }
 
@@ -185,17 +168,8 @@ static long ZCALLBACK fseek_file_func(voidpf opaque, voidpf stream, uLong offset
     default: return -1;
     }
     ret = 0;
-#ifdef __WIIU__
-    {
-        double start = Wiiu_Milliseconds();
-        if (fseek((FILE *)stream, (long)offset, fseek_origin) != 0)
-            ret = -1;
-        Wiiu_AddDriveReadTime(Wiiu_Milliseconds() - start);
-    }
-#else
     if (fseek((FILE *)stream, (long)offset, fseek_origin) != 0)
         ret = -1;
-#endif
     return ret;
 }
 
@@ -257,6 +231,10 @@ void fill_fopen_filefunc(zlib_filefunc_def* pzlib_filefunc_def) {
 }
 
 void fill_fopen64_filefunc(zlib_filefunc64_def* pzlib_filefunc_def) {
+#ifdef __WIIU__
+    Wiiu_FillPk4FileFuncs(pzlib_filefunc_def);
+    return;
+#endif
     pzlib_filefunc_def->zopen64_file = fopen64_file_func;
     pzlib_filefunc_def->zread_file = fread_file_func;
     pzlib_filefunc_def->zwrite_file = fwrite_file_func;
