@@ -28,6 +28,10 @@
 
 #include "ioapi.h"
 
+#ifdef __WIIU__
+#include "sys/wiiu/wiiu_loadprofile.h"
+#endif
+
 voidpf call_zopen64 (const zlib_filefunc64_32_def* pfilefunc, const void*filename, int mode) {
     if (pfilefunc->zfile_func64.zopen64_file != NULL)
         return (*(pfilefunc->zfile_func64.zopen64_file)) (pfilefunc->zfile_func64.opaque,filename,mode);
@@ -129,7 +133,15 @@ static voidpf ZCALLBACK fopen64_file_func(voidpf opaque, const void* filename, i
 static uLong ZCALLBACK fread_file_func(voidpf opaque, voidpf stream, void* buf, uLong size) {
     uLong ret;
     (void)opaque;
+#ifdef __WIIU__
+    {
+        double start = Wiiu_Milliseconds();
+        ret = (uLong)fread(buf, 1, (size_t)size, (FILE *)stream);
+        Wiiu_AddDriveReadTime(Wiiu_Milliseconds() - start);
+    }
+#else
     ret = (uLong)fread(buf, 1, (size_t)size, (FILE *)stream);
+#endif
     return ret;
 }
 
@@ -173,8 +185,17 @@ static long ZCALLBACK fseek_file_func(voidpf opaque, voidpf stream, uLong offset
     default: return -1;
     }
     ret = 0;
+#ifdef __WIIU__
+    {
+        double start = Wiiu_Milliseconds();
+        if (fseek((FILE *)stream, (long)offset, fseek_origin) != 0)
+            ret = -1;
+        Wiiu_AddDriveReadTime(Wiiu_Milliseconds() - start);
+    }
+#else
     if (fseek((FILE *)stream, (long)offset, fseek_origin) != 0)
         ret = -1;
+#endif
     return ret;
 }
 

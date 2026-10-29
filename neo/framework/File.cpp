@@ -32,6 +32,10 @@ If you have questions concerning this license or the applicable additional terms
 
 #include "framework/File.h"
 
+#ifdef __WIIU__
+#include "sys/wiiu/wiiu_loadprofile.h"
+#endif
+
 #define	MAX_PRINT_MSG		4096
 
 /*
@@ -1260,6 +1264,9 @@ Properly handles partial reads
 =================
 */
 int idFile_InZip::Read( void *buffer, int len ) {
+#ifdef __WIIU__
+	idWiiULoadTimer readTimer( wiiuLoadProfile.pk4ReadMs );
+#endif
 	int l = unzReadCurrentFile( z, buffer, len );
 	fileSystem->AddToReadCount( l );
 	return l;

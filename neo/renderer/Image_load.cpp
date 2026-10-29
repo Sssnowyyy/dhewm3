@@ -32,6 +32,10 @@ If you have questions concerning this license or the applicable additional terms
 
 #include "renderer/Image.h"
 
+#ifdef __WIIU__
+#include "sys/wiiu/wiiu_loadprofile.h"
+#endif
+
 /*
 PROBLEM: compressed textures may break the zero clamp rule!
 */
@@ -1641,6 +1645,9 @@ On exit, the idImage will have a valid OpenGL texture number that can be bound
 ===============
 */
 void	idImage::ActuallyLoadImage( bool checkForPrecompressed, bool fromBackEnd ) {
+#ifdef __WIIU__
+	idWiiULoadTimer loadTimer( wiiuLoadProfile.imageMs );
+#endif
 	int		width, height;
 	byte	*pic;
 

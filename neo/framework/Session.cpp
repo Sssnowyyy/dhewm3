@@ -37,6 +37,19 @@ If you have questions concerning this license or the applicable additional terms
 
 #include "framework/Session_local.h"
 
+#ifdef __WIIU__
+#include "sys/wiiu/wiiu_loadprofile.h"
+#endif
+
+#ifdef __WIIU__
+// Wii U: level load phases, see the end of ExecuteMapChange()
+enum { LOAD_START, LOAD_PREPARED, LOAD_GEOMETRY, LOAD_ENTITIES, LOAD_PLAYER, LOAD_RENDERER, LOAD_SOUND, LOAD_DECLS, LOAD_GUI, LOAD_SETTLED, NUM_LOAD_MARKS };
+static double loadMarks[NUM_LOAD_MARKS];
+#define LOAD_MARK( i ) loadMarks[i] = Sys_MillisecondsPrecise()
+#else
+#define LOAD_MARK( i )
+#endif
+
 #if defined(__AROS__)
 #define CDKEY_FILEPATH CDKEY_FILE
 #define XPKEY_FILEPATH XPKEY_FILE
@@ -1596,6 +1609,12 @@ void idSessionLocal::ExecuteMapChange( bool noFadeWipe ) {
 		currentMapName = fullMapName;
 	}
 
+#ifdef __WIIU__
+	memset( loadMarks, 0, sizeof( loadMarks ) );
+	memset( &wiiuLoadProfile, 0, sizeof( wiiuLoadProfile ) );
+#endif
+	LOAD_MARK( LOAD_START );
+
 	// note which media we are going to need to load
 	if ( !reloadingSameMap ) {
 		declManager->BeginLevelLoad();
@@ -1644,10 +1663,12 @@ void idSessionLocal::ExecuteMapChange( bool noFadeWipe ) {
 	common->Printf( "----- Map Initialization -----\n" );
 	common->Printf( "Map: %s\n", mapString.c_str() );
 
+	LOAD_MARK( LOAD_PREPARED );
 	// let the renderSystem load all the geometry
 	if ( !rw->InitFromMap( fullMapName ) ) {
 		common->Error( "couldn't load %s", fullMapName.c_str() );
 	}
+	LOAD_MARK( LOAD_GEOMETRY );
 
 	// for the synchronous networking we needed to roll the angles over from
 	// level to level, but now we can just clear everything
@@ -1678,21 +1699,27 @@ void idSessionLocal::ExecuteMapChange( bool noFadeWipe ) {
 		game->InitFromNewMap( fullMapName + ".map", rw, sw, idAsyncNetwork::server.IsActive(), idAsyncNetwork::client.IsActive(), Sys_Milliseconds() );
 	}
 
+	LOAD_MARK( LOAD_ENTITIES );
 	if ( !idAsyncNetwork::IsActive() && !loadingSaveGame ) {
 		// spawn players
 		for ( i = 0; i < numClients; i++ ) {
 			game->SpawnPlayer( i );
 		}
 	}
+	LOAD_MARK( LOAD_PLAYER );
 
 	// actually purge/load the media
 	if ( !reloadingSameMap ) {
 		renderSystem->EndLevelLoad();
+		LOAD_MARK( LOAD_RENDERER );
 		soundSystem->EndLevelLoad( mapString.c_str() );
+		LOAD_MARK( LOAD_SOUND );
 		declManager->EndLevelLoad();
 		SetBytesNeededForMapLoad( mapString.c_str(), fileSystem->GetReadCount() );
+		LOAD_MARK( LOAD_DECLS );
 	}
 	uiManager->EndLevelLoad();
+	LOAD_MARK( LOAD_GUI );
 
 	if ( !idAsyncNetwork::IsActive() && !loadingSaveGame ) {
 		// run a few frames to allow everything to settle
@@ -1703,6 +1730,27 @@ void idSessionLocal::ExecuteMapChange( bool noFadeWipe ) {
 
 	int	msec = Sys_Milliseconds() - start;
 	common->Printf( "%6d msec to load %s\n", msec, mapString.c_str() );
+
+#ifdef __WIIU__
+	LOAD_MARK( LOAD_SETTLED );
+	for ( i = 1; i < NUM_LOAD_MARKS; i++ ) {
+		if ( loadMarks[i] == 0.0 ) {
+			loadMarks[i] = loadMarks[i-1];	// phase skipped
+		}
+	}
+	#define LOAD_PHASE( i ) ( ( loadMarks[i] - loadMarks[i-1] ) / 1000.0 )
+	common->Printf( "Load phases (s): prepare %.1f | geometry %.1f | entities %.1f | player %.1f | renderer end (models, images) %.1f"
+		" | sound end %.1f | decls %.1f | gui %.1f | settle %.1f | total %.1f\n",
+		LOAD_PHASE( LOAD_PREPARED ), LOAD_PHASE( LOAD_GEOMETRY ), LOAD_PHASE( LOAD_ENTITIES ), LOAD_PHASE( LOAD_PLAYER ),
+		LOAD_PHASE( LOAD_RENDERER ), LOAD_PHASE( LOAD_SOUND ), LOAD_PHASE( LOAD_DECLS ), LOAD_PHASE( LOAD_GUI ), LOAD_PHASE( LOAD_SETTLED ),
+		( loadMarks[LOAD_SETTLED] - loadMarks[LOAD_START] ) / 1000.0 );
+	#undef LOAD_PHASE
+	const wiiuLoadProfile_t &lp = wiiuLoadProfile;
+	common->Printf( "Load totals (s, across phases): drive reads %.1f | .pk4 reads incl. decompression %.1f | sounds %.1f"
+		" (decoding %d .ogg: %.1f) | models %.1f | images %.1f\n",
+		lp.driveReadMs / 1000.0, lp.pk4ReadMs / 1000.0, lp.soundMs / 1000.0, lp.decodedSounds, lp.soundDecodeMs / 1000.0,
+		lp.modelMs / 1000.0, lp.imageMs / 1000.0 );
+#endif
 
 	// let the renderSystem generate interactions now that everything is spawned
 	rw->GenerateAllInteractions();

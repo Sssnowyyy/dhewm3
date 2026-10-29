@@ -31,6 +31,10 @@ If you have questions concerning this license or the applicable additional terms
 
 #include "sound/snd_local.h"
 
+#ifdef __WIIU__
+#include "sys/wiiu/wiiu_loadprofile.h"
+#endif
+
 #define USE_SOUND_CACHE_ALLOCATOR
 
 #ifdef USE_SOUND_CACHE_ALLOCATOR
@@ -431,6 +435,9 @@ Loads based on name, possibly doing a MakeDefault if necessary
 ===================
 */
 void idSoundSample::Load( void ) {
+#ifdef __WIIU__
+	idWiiULoadTimer loadTimer( wiiuLoadProfile.soundMs );
+#endif
 	defaultSound = false;
 	purged = false;
 	hardwareBuffer = false;
@@ -516,7 +523,15 @@ void idSoundSample::Load( void ) {
 					float *destData = (float *)soundCacheAllocator.Alloc( ( LengthIn44kHzSamples() + 1 ) * sizeof( float ) );
 
 					// Decoder *always* outputs 44 kHz data
+#ifdef __WIIU__
+					{
+						idWiiULoadTimer decodeTimer( wiiuLoadProfile.soundDecodeMs );
+						wiiuLoadProfile.decodedSounds++;
+#endif
 					decoder->Decode( this, 0, LengthIn44kHzSamples(), destData );
+#ifdef __WIIU__
+					}
+#endif
 
 					// Downsample back to original frequency (save memory)
 					if ( objectInfo.nSamplesPerSec == 11025 ) {

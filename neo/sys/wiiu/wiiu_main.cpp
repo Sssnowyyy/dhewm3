@@ -52,10 +52,21 @@ If you have questions concerning this license or the applicable additional terms
 #include "framework/Licensee.h"
 #include "sys/sys_local.h"
 #include "sys/sys_sdl.h"
+#include "sys/wiiu/wiiu_loadprofile.h"
 
 // game data, config and savegames all live here on the SD card:
 //   sd:/wiiu/apps/dhewm3/base/pak000.pk4 ...
 #define WIIU_DATA_PATH "fs:/vol/external01/wiiu/apps/dhewm3"
+
+wiiuLoadProfile_t wiiuLoadProfile;
+
+extern "C" double Wiiu_Milliseconds( void ) {
+	return Sys_MillisecondsPrecise();
+}
+
+extern "C" void Wiiu_AddDriveReadTime( double ms ) {
+	wiiuLoadProfile.driveReadMs += ms;
+}
 
 idCVar com_pid( "com_pid", "0", CVAR_INTEGER | CVAR_INIT | CVAR_SYSTEM, "process id" );
 

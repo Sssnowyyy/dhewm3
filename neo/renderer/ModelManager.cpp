@@ -35,6 +35,10 @@ If you have questions concerning this license or the applicable additional terms
 
 #include "renderer/ModelManager.h"
 
+#ifdef __WIIU__
+#include "sys/wiiu/wiiu_loadprofile.h"
+#endif
+
 class idRenderModelManagerLocal : public idRenderModelManager {
 public:
 							idRenderModelManagerLocal();
@@ -253,6 +257,9 @@ idRenderModelManagerLocal::GetModel
 =================
 */
 idRenderModel *idRenderModelManagerLocal::GetModel( const char *modelName, bool createIfNotFound ) {
+#ifdef __WIIU__
+	idWiiULoadTimer loadTimer( wiiuLoadProfile.modelMs );
+#endif
 	idStr		canonical;
 	idStr		extension;
 
