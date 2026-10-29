@@ -119,7 +119,9 @@ void *GX2GL_FrameAlloc( size_t size, size_t align ) {
 			common->FatalError( "GX2GL_FrameAlloc: %u bytes is more than the whole arena", (unsigned)size );
 		}
 		// let the GPU catch up, then everything already submitted is done with the arena
-		GX2DrawDone();
+		if ( gx2Foreground ) {
+			GX2DrawDone();
+		}
 		InvalidateAttributeCache();
 		ofs = 0;
 	}
@@ -678,7 +680,11 @@ void GX2GL_Init( void ) {
 }
 
 void GX2GL_Shutdown( void ) {
-	GX2DrawDone();
+	// after ProcUI took the foreground (exiting from the HOME menu) the GPU
+	// doesn't run our commands anymore, waiting for it would hang
+	if ( gx2Foreground ) {
+		GX2DrawDone();
+	}
 	for ( int i = 0; i < NUM_FRAME_SLOTS; i++ ) {
 		for ( int j = 0; j < deferredFrees[i].Num(); j++ ) {
 			free( deferredFrees[i][j] );
@@ -779,7 +785,9 @@ void GX2GL_EndFrame( OSTime submitted ) {
 	frameSlot = ( frameSlot + 1 ) % NUM_FRAME_SLOTS;
 
 	// wait until the GPU is done with the last frame that used the next slot
-	if ( r_gx2Pipeline.GetBool() ) {
+	if ( !gx2Foreground ) {
+		// it doesn't run our commands while the HOME menu has it
+	} else if ( r_gx2Pipeline.GetBool() ) {
 		GX2WaitTimeStamp( frameSlotTimeStamps[frameSlot] );
 	} else {
 		GX2DrawDone();
@@ -1681,7 +1689,9 @@ void APIENTRY glClear( GLbitfield mask ) {
 
 void APIENTRY glFinish( void ) {
 	CHECK_THREAD();
-	GX2DrawDone();
+	if ( gx2Foreground ) {
+		GX2DrawDone();
+	}
 }
 
 void APIENTRY glFlush( void ) {
@@ -2048,8 +2058,14 @@ static void AllocTexture( glTexture_t *t, bool cube, int width, int height, GLen
 
 	// image and mip chain in one allocation. Not cleared: the GPU fills every level
 	// that gets used (the sampler's max LOD is the highest uploaded level), and
-	// clearing and flushing all that memory made level loads slower
+	// clearing all that memory made level loads slower
 	tex.surface.image = memalign( tex.surface.alignment, tex.surface.imageSize + tex.surface.mipmapSize );
+	// ...but the CPU's data cache may still hold changes to this memory from
+	// whatever used it before (often the file the texture was loaded from). If
+	// they're written back after the GPU filled in the texture, they overwrite
+	// parts of it, which looked like blocks of garbage in textures on a real Wii U
+	// (Cemu doesn't emulate the cache). So write them back now.
+	DCFlushRange( tex.surface.image, tex.surface.imageSize + tex.surface.mipmapSize );
 	tex.surface.mipmaps = tex.surface.mipmapSize ? (byte *)tex.surface.image + tex.surface.imageSize : NULL;
 
 	if ( !PhysicallyContiguous( tex.surface.image, tex.surface.imageSize + tex.surface.mipmapSize ) ) {
@@ -2326,7 +2342,7 @@ static void APIENTRY gx2_glCompressedTexImage2DARB( GLenum target, GLint level, 
 	totalCompressedUploads++;
 
 	static int checkedAtUpload;
-	if ( level == 0 && r_gx2VerifyTextures.GetBool() && checkedAtUpload < 150 ) {
+	if ( level == 0 && r_gx2VerifyTextures.GetBool() && gx2Foreground && checkedAtUpload < 150 ) {
 		checkedAtUpload++;
 		if ( VerifyTexture( t, gl.units[gl.activeUnit].bound2D, "right after upload" ) ) {
 			verifiedOkAtUpload++;
