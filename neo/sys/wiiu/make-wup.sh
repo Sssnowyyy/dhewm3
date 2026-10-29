@@ -72,6 +72,7 @@ fi
 # (its output includes the keys, leave those out)
 ( cd "$WUP" && java -jar ../tools/NUSPacker.jar -in in -out out ) 2>&1 | grep -viE "key" || true
 rm -f "$KEYFILE"
+rm -rf "$WUP/tmp" "$WUP/output"	# NUSPacker's working directories
 
 if [ ! -f "$WUP/out/title.tmd" ]; then
 	echo "packing failed"
