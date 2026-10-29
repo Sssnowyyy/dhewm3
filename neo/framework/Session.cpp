@@ -1617,7 +1617,11 @@ void idSessionLocal::ExecuteMapChange( bool noFadeWipe ) {
 
 #ifdef __WIIU__
 	memset( loadMarks, 0, sizeof( loadMarks ) );
-	memset( &wiiuLoadProfile, 0, sizeof( wiiuLoadProfile ) );
+	{
+		int crcErrors = wiiuLoadProfile.crcErrors;
+		memset( &wiiuLoadProfile, 0, sizeof( wiiuLoadProfile ) );
+		wiiuLoadProfile.crcErrors = crcErrors;
+	}
 	Wiiu_PrintMemory( "before loading" );
 #endif
 	LOAD_MARK( LOAD_START );
@@ -1757,9 +1761,9 @@ void idSessionLocal::ExecuteMapChange( bool noFadeWipe ) {
 	#undef LOAD_PHASE
 	const wiiuLoadProfile_t &lp = wiiuLoadProfile;
 	common->Printf( "Load totals (s, across phases): drive reads %.1f (%d reads, %.0f MB) | .pk4 reads incl. decompression %.1f"
-		" (%d files) | sounds %.1f (decoding %d .ogg: %.1f) | models %.1f | images %.1f | %d lookups in base/ skipped\n",
+		" (%d files) | sounds %.1f (decoding %d .ogg: %.1f) | models %.1f | images %.1f | %d lookups in base/ skipped | %d CRC errors in .pk4 reads so far\n",
 		lp.driveReadMs / 1000.0, lp.driveReads, lp.driveReadBytes / ( 1024.0 * 1024.0 ), lp.pk4ReadMs / 1000.0, lp.pk4Opens,
-		lp.soundMs / 1000.0, lp.decodedSounds, lp.soundDecodeMs / 1000.0, lp.modelMs / 1000.0, lp.imageMs / 1000.0, lp.skippedLookups );
+		lp.soundMs / 1000.0, lp.decodedSounds, lp.soundDecodeMs / 1000.0, lp.modelMs / 1000.0, lp.imageMs / 1000.0, lp.skippedLookups, lp.crcErrors );
 	Wiiu_PrintMemory( "after loading" );
 #endif
 

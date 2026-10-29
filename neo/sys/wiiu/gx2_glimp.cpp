@@ -99,6 +99,7 @@ away while the HOME menu is open.
 ===============
 */
 static uint32_t AcquireForeground( void *context ) {
+	common->Printf( "ProcUI: got the foreground back\n" );
 	MEMHeapHandle fg = MEMGetBaseHeapHandle( MEM_BASE_HEAP_FG );
 	tvScanBuffer = MEMAllocFromFrmHeapEx( fg, tvScanBufferSize, GX2_SCAN_BUFFER_ALIGNMENT );
 	drcScanBuffer = MEMAllocFromFrmHeapEx( fg, drcScanBufferSize, GX2_SCAN_BUFFER_ALIGNMENT );
@@ -115,6 +116,8 @@ static uint32_t AcquireForeground( void *context ) {
 }
 
 static uint32_t ReleaseForeground( void *context ) {
+	Wiiu_LogEveryLine();
+	common->Printf( "ProcUI: releasing the foreground\n" );
 	if ( gx2Foreground ) {
 		GX2DrawDone();
 		MEMFreeToFrmHeap( MEMGetBaseHeapHandle( MEM_BASE_HEAP_FG ), MEM_FRM_HEAP_FREE_ALL );
@@ -187,6 +190,8 @@ static int RenderThreadMain( int argc, const char **argv ) {
 		}
 		renderCmds = NULL;
 		if ( procRunning && !WHBProcIsRunning() ) {
+			Wiiu_LogEveryLine();
+			common->Printf( "render thread: ProcUI says we're exiting\n" );
 			procRunning = false;
 		}
 		OSSignalEvent( &renderIdle );
@@ -492,7 +497,10 @@ void GLimp_Shutdown( void ) {
 	if ( !gx2Initialized ) {
 		return;
 	}
+	Wiiu_LogEveryLine();
+	common->Printf( "GLimp_Shutdown: stopping the render thread\n" );
 	StopRenderThread();
+	common->Printf( "GLimp_Shutdown: render thread stopped, shutting down GX2\n" );
 	GX2GL_Shutdown();
 	WiiU_KeyboardShutdown();
 	if ( drcContextState ) {
@@ -511,6 +519,7 @@ void GLimp_Shutdown( void ) {
 	free( gx2ContextState );
 	free( commandBufferPool );
 	gx2Initialized = false;
+	common->Printf( "GLimp_Shutdown: done\n" );
 }
 
 /*
@@ -675,6 +684,7 @@ static void ProfileFrame( double gpuWaitMs, int draws ) {
 			prof.gameMs / n, prof.frontendMs / n, prof.backendMs / n, prof.gpuWaitMs / n, prof.draws / n, Wiiu_MemoryUsedMB(),
 			renderWaitMs / n, renderSyncs, lastSyncReason ? lastSyncReason : "-" );
 		common->Printf( "Wii U threads: engine thread on CPU%u, %d core moves, %d failed\n", engineCore, moves, failedMoves );
+		GX2GL_VerifySomeTextures();
 		moves = failedMoves = 0;
 		renderWaitMs = 0.0;
 		renderSyncs = 0;

@@ -142,6 +142,13 @@ static FILE* consoleLog = NULL;
 static OSTime lastLogSync = 0;
 static OSThread* engineThread = NULL;
 static bool procExiting = false; // ProcUI told us to exit (HOME menu "close software")
+static volatile bool logEveryLine = false;
+
+// from now on every line goes to the SD card right away (when exiting, so a hang
+// doesn't lose the last lines)
+void Wiiu_LogEveryLine( void ) {
+	logEveryLine = true;
+}
 
 static void Wiiu_SyncLog() {
 	if ( consoleLog != NULL ) {
@@ -163,6 +170,7 @@ main() return instead of calling exit() from it.
 ================
 */
 static void Wiiu_Exit( int ret ) {
+	Sys_Printf( "Wiiu_Exit(%d)%s\n", ret, procExiting ? "" : ", going back to the Wii U Menu" );
 	if ( consoleLog != NULL ) {
 		fclose( consoleLog );
 		consoleLog = NULL;
@@ -200,6 +208,7 @@ void idSysLocal::OpenURL( const char *url, bool quit ) {
 }
 
 void Sys_Quit( void ) {
+	Wiiu_LogEveryLine();
 	Wiiu_Exit( EXIT_SUCCESS );
 }
 
@@ -431,7 +440,7 @@ void Sys_VPrintf( const char *msg, va_list arg ) {
 		// a crash would lose whatever is still buffered, but syncing the SD card
 		// for every line slows down loading, so do it at most once per second
 		// (Cemu doesn't even write anything to the host file before that)
-		if ( OSGetSystemTime() - lastLogSync > OSSecondsToTicks( 1 ) ) {
+		if ( logEveryLine || OSGetSystemTime() - lastLogSync > OSSecondsToTicks( 1 ) ) {
 			Wiiu_SyncLog();
 		}
 	}
@@ -539,6 +548,8 @@ static int EngineThreadMain( int argc, const char **argv ) {
 	}
 
 	// the user closed us from the HOME menu
+	Wiiu_LogEveryLine();
+	common->Printf( "ProcUI says we're exiting, shutting down\n" );
 	procExiting = true;
 	common->Quit(); // ends in Sys_Quit(), which ends this thread
 	return 0;

@@ -48,6 +48,7 @@ Current limitations:
 
 #include <malloc.h>
 #include <coreinit/mutex.h>
+#include <coreinit/memorymap.h>
 
 #include <coreinit/cache.h>
 #include <gx2/clear.h>
@@ -89,6 +90,7 @@ idCVar r_gx2Debug( "r_gx2Debug", "0", CVAR_RENDERER | CVAR_INTEGER, "print GX2 G
 #define FRAME_ARENA_SIZE	( 16 * 1024 * 1024 )
 #define NUM_FRAME_SLOTS		2
 
+idCVar r_gx2VerifyTextures( "r_gx2VerifyTextures", "1", CVAR_RENDERER | CVAR_BOOL, "diagnostics: read precompressed textures back from the GPU and compare them with what was uploaded" );
 idCVar r_gx2StateCache( "r_gx2StateCache", "1", CVAR_RENDERER | CVAR_BOOL, "only send render state, shaders and textures to the GPU when they change" );
 idCVar r_gx2Pipeline( "r_gx2Pipeline", "1", CVAR_RENDERER | CVAR_BOOL, "let the CPU prepare the next frame while the GPU draws the last one (0: wait for the GPU every frame)" );
 
@@ -200,6 +202,9 @@ struct glTexture_t {
 	GX2Sampler		sampler;
 	bool			samplerDirty;
 	uint32_t		bindVersion;	// changes whenever the texture or sampler registers do
+	// diagnostics, see VerifyTexture(): checksum of the precompressed level 0 as uploaded
+	bool			verify;
+	uint32_t		level0Sum;
 };
 static uint32_t bindVersionCounter;
 
@@ -1902,6 +1907,114 @@ static uint32_t CompMap( GLenum internalFormat ) {
 }
 
 // (re)creates the GX2 texture for a new level 0 size
+/*
+===============================================================================
+
+	Diagnostics for textures that look corrupted on a real Wii U (not in Cemu)
+
+===============================================================================
+*/
+
+static int		nonContiguousTextures;
+static int		verifiedOk, verifiedBad, verifiedOkAtUpload, verifiedBadAtUpload, verifyPrints;
+static int		verifyNext;
+
+// the GPU sees physical memory: true if the CPU's view of it is one block there too
+static bool PhysicallyContiguous( const void *ptr, size_t size ) {
+	uint32_t base = OSEffectiveToPhysical( (uint32_t)(uintptr_t)ptr );
+	if ( !base ) {
+		return false;
+	}
+	for ( size_t ofs = 4096 - ( (uintptr_t)ptr & 4095 ); ofs < size; ofs += 4096 ) {
+		if ( OSEffectiveToPhysical( (uint32_t)(uintptr_t)ptr + ofs ) != base + ofs ) {
+			return false;
+		}
+	}
+	return OSEffectiveToPhysical( (uint32_t)(uintptr_t)ptr + size - 1 ) == base + size - 1;
+}
+
+static uint32_t BlockRowsSum( const byte *data, uint32_t pitchBytes, int rows, int rowBytes ) {
+	uint32_t sum = 2166136261u;
+	for ( int row = 0; row < rows; row++ ) {
+		const byte *p = data + row * pitchBytes;
+		for ( int i = 0; i < rowBytes; i++ ) {
+			sum = ( sum ^ p[i] ) * 16777619u;
+		}
+	}
+	return sum;
+}
+
+static void CompressedLayout( const glTexture_t *t, int &blocksWide, int &blocksHigh, int &blockBytes ) {
+	blockBytes = ( t->internalFormat <= GL_COMPRESSED_RGBA_S3TC_DXT1_EXT ) ? 8 : 16;
+	blocksWide = ( (int)t->tex.surface.width + 3 ) / 4;
+	blocksHigh = ( (int)t->tex.surface.height + 3 ) / 4;
+}
+
+// copies level 0 of a precompressed texture back into a linear surface and
+// compares it with what was uploaded. 1: same, 0: different
+static int VerifyTexture( glTexture_t *t, int texnum, const char *when ) {
+	GX2Surface lin;
+	memset( &lin, 0, sizeof( lin ) );
+	lin.dim = GX2_SURFACE_DIM_TEXTURE_2D;
+	lin.width = t->tex.surface.width;
+	lin.height = t->tex.surface.height;
+	lin.depth = 1;
+	lin.mipLevels = 1;
+	lin.format = t->tex.surface.format;
+	lin.aa = GX2_AA_MODE1X;
+	lin.use = GX2_SURFACE_USE_TEXTURE;
+	lin.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
+	GX2CalcSurfaceSizeAndAlignment( &lin );
+	lin.image = GX2GL_FrameAlloc( lin.imageSize, Max( (uint32_t)64, lin.alignment ) );
+	memset( lin.image, 0xcd, lin.imageSize );
+	DCFlushRange( lin.image, lin.imageSize );
+
+	GX2CopySurface( &t->tex.surface, 0, 0, &lin, 0, 0 );
+	GX2GL_RestoreState();
+	GX2Invalidate( (GX2InvalidateMode)( GX2_INVALIDATE_MODE_COLOR_BUFFER | GX2_INVALIDATE_MODE_TEXTURE ), lin.image, lin.imageSize );
+	GX2DrawDone();
+	DCInvalidateRange( lin.image, lin.imageSize );
+
+	int blocksWide, blocksHigh, blockBytes;
+	CompressedLayout( t, blocksWide, blocksHigh, blockBytes );
+	uint32_t sum = BlockRowsSum( (const byte *)lin.image, lin.pitch * blockBytes, blocksHigh, blocksWide * blockBytes );
+	if ( sum == t->level0Sum ) {
+		return 1;
+	}
+	if ( verifyPrints++ < 15 ) {
+		common->Printf( "GX2GL texture check (%s): texture %d (%ux%u, format 0x%x, %u bytes at %p) differs from what was uploaded%s\n",
+			when, texnum, t->tex.surface.width, t->tex.surface.height, t->internalFormat, t->tex.surface.imageSize + t->tex.surface.mipmapSize,
+			t->tex.surface.image, PhysicallyContiguous( t->tex.surface.image, t->tex.surface.imageSize + t->tex.surface.mipmapSize ) ? "" : ", not physically contiguous" );
+	}
+	return 0;
+}
+
+} // extern "C"
+
+// a few textures per call, all of them over time
+void GX2GL_VerifySomeTextures( void ) {
+	if ( !r_gx2VerifyTextures.GetBool() || !gx2Foreground ) {
+		return;
+	}
+	int checked = 0;
+	for ( int n = 0; n < textures.Num() && checked < 24; n++ ) {
+		verifyNext = ( verifyNext + 1 ) % Max( 1, textures.Num() );
+		glTexture_t *t = textures[verifyNext];
+		if ( t && t->allocated && t->verify ) {
+			if ( VerifyTexture( t, verifyNext, "later" ) ) {
+				verifiedOk++;
+			} else {
+				verifiedBad++;
+			}
+			checked++;
+		}
+	}
+	common->Printf( "GX2GL texture check: right after upload %d ok, %d differ | later %d ok, %d differ | %d textures not physically contiguous\n",
+		verifiedOkAtUpload, verifiedBadAtUpload, verifiedOk, verifiedBad, nonContiguousTextures );
+}
+
+extern "C" {
+
 static void AllocTexture( glTexture_t *t, bool cube, int width, int height, GLenum internalFormat ) {
 	if ( t->allocated ) {
 		if ( (int)t->tex.surface.width == width && (int)t->tex.surface.height == height && t->internalFormat == internalFormat ) {
@@ -1939,6 +2052,13 @@ static void AllocTexture( glTexture_t *t, bool cube, int width, int height, GLen
 	tex.surface.image = memalign( tex.surface.alignment, tex.surface.imageSize + tex.surface.mipmapSize );
 	tex.surface.mipmaps = tex.surface.mipmapSize ? (byte *)tex.surface.image + tex.surface.imageSize : NULL;
 
+	if ( !PhysicallyContiguous( tex.surface.image, tex.surface.imageSize + tex.surface.mipmapSize ) ) {
+		if ( nonContiguousTextures++ < 5 ) {
+			common->Printf( "GX2GL: texture memory at %p (%u bytes) isn't physically contiguous\n", tex.surface.image,
+				tex.surface.imageSize + tex.surface.mipmapSize );
+		}
+	}
+	t->verify = false;
 	t->allocated = true;
 	t->bindVersion = ++bindVersionCounter;
 	t->internalFormat = internalFormat;
@@ -2190,6 +2310,10 @@ static void APIENTRY gx2_glCompressedTexImage2DARB( GLenum target, GLint level, 
 	for ( int row = 0; row < blocksHigh; row++ ) {
 		memcpy( (byte *)stage.image + row * rowBytes, src + row * blocksWide * blockBytes, blocksWide * blockBytes );
 	}
+	if ( level == 0 ) {
+		t->level0Sum = BlockRowsSum( (const byte *)data, blocksWide * blockBytes, blocksHigh, blocksWide * blockBytes );
+		t->verify = true;
+	}
 	// GX2CopySurface() reads the staging memory through the GPU's texture cache,
 	// which may still hold what an earlier upload put there (a real Wii U shows
 	// that as blocks of garbage in the texture, Cemu doesn't emulate the cache)
@@ -2200,6 +2324,16 @@ static void APIENTRY gx2_glCompressedTexImage2DARB( GLenum target, GLint level, 
 	GX2GL_RestoreState();
 	GX2Invalidate( GX2_INVALIDATE_MODE_TEXTURE, t->tex.surface.image, t->tex.surface.imageSize + t->tex.surface.mipmapSize );
 	totalCompressedUploads++;
+
+	static int checkedAtUpload;
+	if ( level == 0 && r_gx2VerifyTextures.GetBool() && checkedAtUpload < 150 ) {
+		checkedAtUpload++;
+		if ( VerifyTexture( t, gl.units[gl.activeUnit].bound2D, "right after upload" ) ) {
+			verifiedOkAtUpload++;
+		} else {
+			verifiedBadAtUpload++;
+		}
+	}
 
 	if ( level > t->maxLevel ) {
 		t->maxLevel = level;

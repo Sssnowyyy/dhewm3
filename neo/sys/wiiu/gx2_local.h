@@ -69,4 +69,7 @@ void *	GX2GL_FrameAlloc( size_t size, size_t align = 64 );
 
 void	GX2GL_DrawTestPattern( int mode );
 
+// diagnostics: checks a few precompressed textures and logs the results
+void	GX2GL_VerifySomeTextures( void );
+
 #endif

@@ -9,7 +9,8 @@ struct wiiuLoadProfile_t {
 	int		driveReads;
 	double	driveReadBytes;
 	int		pk4Opens;			// files opened in .pk4s
-	int		skippedLookups;		// looking for a file in base/ skipped as its directory doesn't exist
+	int		skippedLookups;
+	int		crcErrors;			// files read from .pk4s whose CRC didn't match (not reset per level)		// looking for a file in base/ skipped as its directory doesn't exist
 	double	pk4ReadMs;			// reads from .pk4 files incl. decompression
 	double	soundMs;			// loading sound samples
 	double	soundDecodeMs;		// decoding .ogg sounds to PCM at load time (part of soundMs)
@@ -22,6 +23,7 @@ extern wiiuLoadProfile_t wiiuLoadProfile;
 
 // see wiiu_main.cpp
 bool	Wiiu_FileMayExist( const char *path );
+void	Wiiu_LogEveryLine( void );
 
 // memory use, from malloc()'s point of view (the GPU's memory comes from there too)
 int		Wiiu_MemoryUsedMB( void );

@@ -1252,7 +1252,17 @@ idFile_InZip::~idFile_InZip
 =================
 */
 idFile_InZip::~idFile_InZip( void ) {
+#ifdef __WIIU__
+	// diagnostics: minizip checks the CRC of files that were read completely
+	if ( unzCloseCurrentFile( z ) == UNZ_CRCERROR ) {
+		int n = ++wiiuLoadProfile.crcErrors;
+		if ( n <= 20 ) {
+			common->Printf( "WARNING: CRC error reading %s from a .pk4\n", name.c_str() );
+		}
+	}
+#else
 	unzCloseCurrentFile( z );
+#endif
 	unzClose( z );
 }
 
