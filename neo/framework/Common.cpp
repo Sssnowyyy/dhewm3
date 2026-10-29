@@ -1582,6 +1582,16 @@ void Com_ExecMachineSpec_f( const idCmdArgs &args ) {
 	cvarSystem->SetCVarBool( "g_doubleVision", true, CVAR_ARCHIVE );
 	cvarSystem->SetCVarBool( "g_muzzleFlash", true, CVAR_ARCHIVE );
 
+#ifdef __WIIU__
+	// whatever the quality setting: use the precompressed .dds textures (incl. the
+	// RXGB normal maps), the GPU supports them natively. Decoding .tga files and
+	// generating mipmaps on the Wii U's CPU makes level loads take ages, and the
+	// uncompressed textures use a lot of its 1GB of RAM. Never compress at runtime.
+	cvarSystem->SetCVarInteger( "image_usePrecompressedTextures", 1, CVAR_ARCHIVE );
+	cvarSystem->SetCVarInteger( "image_useNormalCompression", 2, CVAR_ARCHIVE );
+	cvarSystem->SetCVarInteger( "image_useCompression", 0, CVAR_ARCHIVE );
+#endif
+
 #if MACOS_X
 	// On low settings, G4 systems & 64MB FX5200/NV34 Systems should default shadows off
 	bool oldArch;

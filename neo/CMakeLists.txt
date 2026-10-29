@@ -1259,6 +1259,7 @@ if(WIIU)
 		sys/wiiu/gx2_gl.cpp
 		sys/wiiu/gx2_glimp.cpp
 		sys/wiiu/wiiu_openal.cpp
+		sys/wiiu/wiiu_keyboard.cpp
 		${src_stub_gl}
 	)
 elseif(AROS)
@@ -1434,7 +1435,10 @@ endif()
 		target_sources(${DHEWM3BINARY} PRIVATE ${wiiu_generated_sources})
 		wut_create_rpx(${DHEWM3BINARY})
 		# bundle for Aroma's Wii U menu integration
-		wut_create_wuhb(${DHEWM3BINARY} NAME "Doom 3" SHORTNAME "Doom 3" AUTHOR "id Software, dhewm3")
+		wut_create_wuhb(${DHEWM3BINARY} NAME "Doom 3" SHORTNAME "Doom 3" AUTHOR "id Software, dhewm3"
+			ICON "${CMAKE_SOURCE_DIR}/sys/wiiu/assets/icon.png"
+			TVSPLASH "${CMAKE_SOURCE_DIR}/sys/wiiu/assets/splash_tv.png"
+			DRCSPLASH "${CMAKE_SOURCE_DIR}/sys/wiiu/assets/splash_drc.png")
 	endif()
 
 	if(NOT APPLE AND NOT WIN32)

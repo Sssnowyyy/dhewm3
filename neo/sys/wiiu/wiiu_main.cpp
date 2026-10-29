@@ -382,6 +382,12 @@ static int EngineThreadMain( int argc, const char **argv ) {
 		"+set", "r_customWidth", "1280",
 		"+set", "r_customHeight", "720",
 		"+set", "r_fullscreen", "1",
+		// use the precompressed .dds textures, but don't compress .tga textures on the
+		// CPU at load time (also enforced by execMachineSpec, see Common.cpp). This
+		// also fixes configs saved before that.
+		"+set", "image_usePrecompressedTextures", "1",
+		"+set", "image_useNormalCompression", "2",
+		"+set", "image_useCompression", "0",
 	};
 	static char *args[64];
 	int numArgs = 0;

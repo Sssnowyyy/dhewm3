@@ -84,11 +84,28 @@ idCVar r_gx2Debug( "r_gx2Debug", "0", CVAR_RENDERER | CVAR_INTEGER, "print GX2 G
 ===============================================================================
 */
 
-#define FRAME_ARENA_SIZE ( 16 * 1024 * 1024 )
+#define FRAME_ARENA_SIZE	( 16 * 1024 * 1024 )
+#define NUM_FRAME_SLOTS		2
 
+idCVar r_gx2Pipeline( "r_gx2Pipeline", "1", CVAR_RENDERER | CVAR_BOOL, "let the CPU prepare the next frame while the GPU draws the last one (0: wait for the GPU every frame)" );
+
+// Per-frame memory is double buffered, so the CPU can work on the next frame while
+// the GPU still draws the previous one: a slot is only reused once the GPU is done
+// with the frame that used it last (GX2GL_EndFrame()).
+static byte *			frameArenas[NUM_FRAME_SLOTS];
+static OSTime			frameSlotTimeStamps[NUM_FRAME_SLOTS];
+static idList<void *>	deferredFrees[NUM_FRAME_SLOTS];	// freed when the GPU is done with the slot's frame
+static int				frameSlot;
 static byte *			frameArena;
 static size_t			frameArenaUsed;
-static idList<void *>	deferredFrees;	// freed when the GPU is done with the frame
+
+// The GPU's vertex/index cache is invalidated once per frame (not per draw, that
+// stalls the GPU). Everything the GPU reads in a frame was written before it read
+// it: client memory data is copied into the frame's arena (which isn't reused
+// within a frame), VBO data is written before the draws that use it.
+static void InvalidateAttributeCache( void ) {
+	GX2Invalidate( GX2_INVALIDATE_MODE_ATTRIBUTE_BUFFER, NULL, 0xFFFFFFFF );
+}
 
 void *GX2GL_FrameAlloc( size_t size, size_t align ) {
 	size_t ofs = ( frameArenaUsed + align - 1 ) & ~( align - 1 );
@@ -98,6 +115,7 @@ void *GX2GL_FrameAlloc( size_t size, size_t align ) {
 		}
 		// let the GPU catch up, then everything already submitted is done with the arena
 		GX2DrawDone();
+		InvalidateAttributeCache();
 		ofs = 0;
 	}
 	frameArenaUsed = ofs + size;
@@ -106,8 +124,17 @@ void *GX2GL_FrameAlloc( size_t size, size_t align ) {
 
 static void DeferredFree( void *ptr ) {
 	if ( ptr ) {
-		deferredFrees.Append( ptr );
+		deferredFrees[frameSlot].Append( ptr );
 	}
+}
+
+// copies data the GPU will read as vertices / indices into this frame's arena: the
+// renderer reuses its own per-frame memory before the GPU has drawn the frame
+static void *CopyToFrame( const void *src, size_t size ) {
+	void *dst = GX2GL_FrameAlloc( size, 64 );
+	memcpy( dst, src, size );
+	DCFlushRange( dst, size );
+	return dst;
 }
 
 /*
@@ -284,6 +311,7 @@ static GLuint					lastDepthTexture;	// debug: last depth texture copied to
 static struct {
 	int				draws, programDraws, skippedPrograms, skippedOther, uploads;
 } stats;
+static int			totalUploads, totalCompressedUploads;	// texture levels since startup
 
 /*
 ===============================================================================
@@ -538,7 +566,12 @@ static GLuint CreateWhiteTexture( GLenum target );
 }
 
 void GX2GL_Init( void ) {
-	frameArena = (byte *)memalign( 256, FRAME_ARENA_SIZE );
+	for ( int i = 0; i < NUM_FRAME_SLOTS; i++ ) {
+		frameArenas[i] = (byte *)memalign( 256, FRAME_ARENA_SIZE );
+		frameSlotTimeStamps[i] = 0;
+	}
+	frameSlot = 0;
+	frameArena = frameArenas[0];
 	frameArenaUsed = 0;
 
 	for ( int i = 0; gx2EmbeddedShaders[i].name; i++ ) {
@@ -602,7 +635,12 @@ void GX2GL_Init( void ) {
 
 void GX2GL_Shutdown( void ) {
 	GX2DrawDone();
-	GX2GL_EndFrame();
+	for ( int i = 0; i < NUM_FRAME_SLOTS; i++ ) {
+		for ( int j = 0; j < deferredFrees[i].Num(); j++ ) {
+			free( deferredFrees[i][j] );
+		}
+		deferredFrees[i].Clear();
+	}
 	for ( int i = 0; i < shaders.Num(); i++ ) {
 		WHBGfxFreeShaderGroup( &shaders[i]->group );
 	}
@@ -622,7 +660,10 @@ void GX2GL_Shutdown( void ) {
 		}
 	}
 	buffers.Clear();
-	free( frameArena );
+	for ( int i = 0; i < NUM_FRAME_SLOTS; i++ ) {
+		free( frameArenas[i] );
+		frameArenas[i] = NULL;
+	}
 	frameArena = NULL;
 }
 
@@ -631,18 +672,35 @@ void GX2GL_RestoreState( void ) {
 	GX2SetShaderMode( GX2_SHADER_MODE_UNIFORM_REGISTER );
 }
 
-void GX2GL_EndFrame( void ) {
-	for ( int i = 0; i < deferredFrees.Num(); i++ ) {
-		free( deferredFrees[i] );
+int GX2GL_FrameDraws( void ) {
+	return stats.draws;
+}
+
+void GX2GL_EndFrame( OSTime submitted ) {
+	frameSlotTimeStamps[frameSlot] = submitted;
+	frameSlot = ( frameSlot + 1 ) % NUM_FRAME_SLOTS;
+
+	// wait until the GPU is done with the last frame that used the next slot
+	if ( r_gx2Pipeline.GetBool() ) {
+		GX2WaitTimeStamp( frameSlotTimeStamps[frameSlot] );
+	} else {
+		GX2DrawDone();
 	}
-	deferredFrees.Clear();
+	for ( int i = 0; i < deferredFrees[frameSlot].Num(); i++ ) {
+		free( deferredFrees[frameSlot][i] );
+	}
+	deferredFrees[frameSlot].Clear();
+	frameArena = frameArenas[frameSlot];
 	frameArenaUsed = 0;
+	InvalidateAttributeCache();
 
 	static int frameNum;
 	frameNum++;
 	if ( r_gx2Debug.GetInteger() > 0 && frameNum % r_gx2Debug.GetInteger() == 0 ) {
-		common->Printf( "GX2GL frame %d: %d draws (%d with programs), %d skipped (no GLSL port), %d skipped (other), %d texture uploads\n",
-			frameNum, stats.draws, stats.programDraws, stats.skippedPrograms, stats.skippedOther, stats.uploads );
+		common->Printf( "GX2GL frame %d: %d draws (%d with programs), %d skipped (no GLSL port), %d skipped (other), %d texture uploads"
+			" (since start: %d uncompressed, %d precompressed levels)\n",
+			frameNum, stats.draws, stats.programDraws, stats.skippedPrograms, stats.skippedOther, stats.uploads,
+			totalUploads, totalCompressedUploads );
 	}
 	memset( &stats, 0, sizeof( stats ) );
 }
@@ -729,7 +787,6 @@ struct stream_t {
 	const void *	ptr;
 	uint32_t		stride;
 	uint32_t		size;		// bytes the GPU may read
-	bool			invalidate;	// client memory, has to be flushed for the GPU
 };
 
 struct fetchShader_t {
@@ -927,7 +984,7 @@ static void SetFixedFunctionUniforms( const gx2Shader_t *sh ) {
 	SetPixelUniform( sh->mode, modes, 4 );
 }
 
-static void Draw( GLenum mode, const vertexSources_t &src, GLenum indexType, const void *indices, int count, int first ) {
+static void Draw( GLenum mode, const vertexSources_t &src, GLenum indexType, const void *indices, bool indicesInBuffer, int count, int first ) {
 	if ( !gx2Foreground || count <= 0 || !src.arrays[SEM_POSITION] ) {
 		return;
 	}
@@ -995,19 +1052,15 @@ static void Draw( GLenum mode, const vertexSources_t &src, GLenum indexType, con
 				return;
 			}
 			if ( a->buffer ) {
-				s.size = Buffer( a->buffer )->size - (uintptr_t)a->ptr;
-				s.invalidate = false;	// done when the buffer was filled
+				s.size = Buffer( a->buffer )->size - (uintptr_t)a->ptr;	// flushed when the buffer was filled
 			} else {
 				s.size = s.stride * ( numVerts - 1 ) + a->size * TypeSize( a->type );
-				s.invalidate = true;
+				s.ptr = CopyToFrame( s.ptr, s.size );
 			}
 		} else {
-			float *c = (float *)GX2GL_FrameAlloc( 4 * sizeof( float ) );
-			memcpy( c, ConstantValue( sem ), 4 * sizeof( float ) );
-			s.ptr = c;
+			s.ptr = CopyToFrame( ConstantValue( sem ), 4 * sizeof( float ) );
 			s.stride = 0;
 			s.size = 4 * sizeof( float );
-			s.invalidate = true;
 			formats[i] = GX2_ATTRIB_FORMAT_FLOAT_32_32_32_32;
 		}
 	}
@@ -1048,9 +1101,6 @@ static void Draw( GLenum mode, const vertexSources_t &src, GLenum indexType, con
 	}
 
 	for ( int i = 0; i < sh->numAttribs; i++ ) {
-		if ( streams[i].invalidate ) {
-			GX2Invalidate( GX2_INVALIDATE_MODE_CPU_ATTRIBUTE_BUFFER, (void *)streams[i].ptr, streams[i].size );
-		}
 		GX2SetAttribBuffer( i, streams[i].size, streams[i].stride, streams[i].ptr );
 	}
 
@@ -1068,7 +1118,9 @@ static void Draw( GLenum mode, const vertexSources_t &src, GLenum indexType, con
 
 	if ( indices ) {
 		int indexSize = indexType == GL_UNSIGNED_SHORT ? 2 : 4;
-		GX2Invalidate( GX2_INVALIDATE_MODE_CPU_ATTRIBUTE_BUFFER, (void *)indices, count * indexSize );
+		if ( !indicesInBuffer ) {
+			indices = CopyToFrame( indices, count * indexSize );
+		}
 		GX2DrawIndexedEx( prim, count, indexType == GL_UNSIGNED_SHORT ? GX2_INDEX_TYPE_U16 : GX2_INDEX_TYPE_U32, indices, 0, 1 );
 	} else {
 		GX2DrawEx( prim, count, first, 1 );
@@ -1076,10 +1128,10 @@ static void Draw( GLenum mode, const vertexSources_t &src, GLenum indexType, con
 	stats.draws++;
 }
 
-static void DrawArraysInternal( GLenum mode, GLenum indexType, const void *indices, int count, int first ) {
+static void DrawArraysInternal( GLenum mode, GLenum indexType, const void *indices, bool indicesInBuffer, int count, int first ) {
 	vertexSources_t src;
 	ClientArraySources( src );
-	Draw( mode, src, indexType, indices, count, first );
+	Draw( mode, src, indexType, indices, indicesInBuffer, count, first );
 }
 
 /*
@@ -1100,7 +1152,11 @@ const GLubyte * APIENTRY glGetString( GLenum name ) {
 		case GL_EXTENSIONS:
 			return (const GLubyte *)"GL_ARB_multitexture GL_ARB_texture_env_combine GL_ARB_texture_cube_map GL_ARB_texture_env_dot3 "
 				"GL_ARB_texture_env_add GL_ARB_texture_non_power_of_two GL_ARB_vertex_buffer_object "
-				"GL_ARB_vertex_program GL_ARB_fragment_program GL_EXT_stencil_wrap";
+				"GL_ARB_vertex_program GL_ARB_fragment_program GL_EXT_stencil_wrap "
+				// GX2 supports these natively (BC1-3), the renderer then uses the
+				// precompressed .dds textures instead of decoding .tga files and
+				// generating mipmaps on the (slow) CPU
+				"GL_ARB_texture_compression GL_EXT_texture_compression_s3tc";
 	}
 	return (const GLubyte *)"";
 }
@@ -1230,11 +1286,11 @@ void APIENTRY glDrawElements( GLenum mode, GLsizei count, GLenum type, const GLv
 		}
 		idx = b->data + (uintptr_t)indices;
 	}
-	DrawArraysInternal( mode, type, idx, count, 0 );
+	DrawArraysInternal( mode, type, idx, gl.elementArrayBuffer != 0, count, 0 );
 }
 
 void APIENTRY glDrawArrays( GLenum mode, GLint first, GLsizei count ) {
-	DrawArraysInternal( mode, GL_UNSIGNED_INT, NULL, count, first );
+	DrawArraysInternal( mode, GL_UNSIGNED_INT, NULL, false, count, first );
 }
 
 // matrices
@@ -1443,8 +1499,7 @@ void APIENTRY glEnd( void ) {
 	if ( n == 0 ) {
 		return;
 	}
-	immVertex_t *verts = (immVertex_t *)GX2GL_FrameAlloc( n * sizeof( immVertex_t ) );
-	memcpy( verts, immVerts.Ptr(), n * sizeof( immVertex_t ) );
+	const immVertex_t *verts = immVerts.Ptr();
 
 	glArray_t pos, color, st;
 	memset( &pos, 0, sizeof( pos ) );
@@ -1463,7 +1518,7 @@ void APIENTRY glEnd( void ) {
 	src.arrays[SEM_COLOR] = &color;
 	src.arrays[SEM_TEXCOORD0] = &st;
 	src.arrays[SEM_ATTRIB0 + 8] = &st;
-	Draw( immMode, src, GL_UNSIGNED_INT, NULL, n, 0 );
+	Draw( immMode, src, GL_UNSIGNED_INT, NULL, false, n, 0 );
 }
 
 void APIENTRY glColor3f( GLfloat r, GLfloat g, GLfloat b ) {
@@ -1574,6 +1629,21 @@ static int CubeFace( GLenum target ) {
 	return -1;
 }
 
+static bool IsS3TCFormat( GLenum internalFormat ) {
+	return internalFormat >= GL_COMPRESSED_RGB_S3TC_DXT1_EXT && internalFormat <= GL_COMPRESSED_RGBA_S3TC_DXT5_EXT;
+}
+
+static GX2SurfaceFormat SurfaceFormat( GLenum internalFormat ) {
+	switch ( internalFormat ) {
+		case GL_COMPRESSED_RGB_S3TC_DXT1_EXT:
+		case GL_COMPRESSED_RGBA_S3TC_DXT1_EXT:	return GX2_SURFACE_FORMAT_UNORM_BC1;
+		case GL_COMPRESSED_RGBA_S3TC_DXT3_EXT:	return GX2_SURFACE_FORMAT_UNORM_BC2;
+		case GL_COMPRESSED_RGBA_S3TC_DXT5_EXT:	return GX2_SURFACE_FORMAT_UNORM_BC3;
+		// everything else is stored as RGBA8, incl. depth textures (packed depth)
+		default:								return GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8;
+	}
+}
+
 static bool IsDepthFormat( GLenum internalFormat ) {
 	return internalFormat == GL_DEPTH_COMPONENT || internalFormat == GL_DEPTH_COMPONENT16_ARB
 		|| internalFormat == GL_DEPTH_COMPONENT24_ARB || internalFormat == GL_DEPTH_COMPONENT32_ARB;
@@ -1592,7 +1662,7 @@ static uint32_t CompMap( GLenum internalFormat ) {
 			return GX2_COMP_MAP( GX2_SQ_SEL_R, GX2_SQ_SEL_R, GX2_SQ_SEL_R, GX2_SQ_SEL_R );
 		case GL_LUMINANCE_ALPHA: case GL_LUMINANCE8_ALPHA8: case 2:
 			return GX2_COMP_MAP( GX2_SQ_SEL_R, GX2_SQ_SEL_R, GX2_SQ_SEL_R, GX2_SQ_SEL_A );
-		case GL_RGB: case GL_RGB8: case GL_RGB5: case 3:
+		case GL_RGB: case GL_RGB8: case GL_RGB5: case 3: case GL_COMPRESSED_RGB_S3TC_DXT1_EXT:
 			return GX2_COMP_MAP( GX2_SQ_SEL_R, GX2_SQ_SEL_G, GX2_SQ_SEL_B, GX2_SQ_SEL_1 );
 		default:
 			return GX2_COMP_MAP( GX2_SQ_SEL_R, GX2_SQ_SEL_G, GX2_SQ_SEL_B, GX2_SQ_SEL_A );
@@ -1621,8 +1691,7 @@ static void AllocTexture( glTexture_t *t, bool cube, int width, int height, GLen
 	tex.surface.height = height;
 	tex.surface.depth = cube ? 6 : 1;
 	tex.surface.mipLevels = levels;
-	// depth textures get copies of gx2DepthColorBuffer, so they hold packed depth too
-	tex.surface.format = GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8;
+	tex.surface.format = SurfaceFormat( internalFormat );
 	tex.surface.aa = GX2_AA_MODE1X;
 	tex.surface.use = GX2_SURFACE_USE_TEXTURE;
 	tex.surface.tileMode = GX2_TILE_MODE_DEFAULT;
@@ -1632,11 +1701,11 @@ static void AllocTexture( glTexture_t *t, bool cube, int width, int height, GLen
 	GX2CalcSurfaceSizeAndAlignment( &tex.surface );
 	GX2InitTextureRegs( &tex );
 
-	// image and mip chain in one allocation
+	// image and mip chain in one allocation. Not cleared: the GPU fills every level
+	// that gets used (the sampler's max LOD is the highest uploaded level), and
+	// clearing and flushing all that memory made level loads slower
 	tex.surface.image = memalign( tex.surface.alignment, tex.surface.imageSize + tex.surface.mipmapSize );
 	tex.surface.mipmaps = tex.surface.mipmapSize ? (byte *)tex.surface.image + tex.surface.imageSize : NULL;
-	memset( tex.surface.image, 0, tex.surface.imageSize + tex.surface.mipmapSize );
-	GX2Invalidate( GX2_INVALIDATE_MODE_CPU_TEXTURE, tex.surface.image, tex.surface.imageSize + tex.surface.mipmapSize );
 
 	t->allocated = true;
 	t->internalFormat = internalFormat;
@@ -1674,6 +1743,11 @@ static void UploadLevel( glTexture_t *t, int level, int face, int x, int y, int 
 					dst[i*4+0] = src[0]; dst[i*4+1] = src[1]; dst[i*4+2] = src[2]; dst[i*4+3] = 255;
 				}
 				break;
+			case GL_BGR_EXT:
+				for ( int i = 0; i < width; i++, src += 3 ) {
+					dst[i*4+0] = src[2]; dst[i*4+1] = src[1]; dst[i*4+2] = src[0]; dst[i*4+3] = 255;
+				}
+				break;
 			case GL_BGRA_EXT:
 				for ( int i = 0; i < width; i++, src += 4 ) {
 					dst[i*4+0] = src[2]; dst[i*4+1] = src[1]; dst[i*4+2] = src[0]; dst[i*4+3] = src[3];
@@ -1706,6 +1780,7 @@ static void UploadLevel( glTexture_t *t, int level, int face, int x, int y, int 
 	}
 	GX2GL_RestoreState();
 	GX2Invalidate( GX2_INVALIDATE_MODE_TEXTURE, t->tex.surface.image, t->tex.surface.imageSize + t->tex.surface.mipmapSize );
+	totalUploads++;
 
 	if ( level > t->maxLevel ) {
 		t->maxLevel = level;
@@ -1746,10 +1821,15 @@ void APIENTRY glTexImage2D( GLenum target, GLint level, GLint internalFormat, GL
 		}
 		return;
 	}
+	if ( IsS3TCFormat( internalFormat ) || internalFormat == GL_COMPRESSED_RGB_ARB || internalFormat == GL_COMPRESSED_RGBA_ARB ) {
+		// asked to compress uncompressed data, that's too slow on the Wii U's CPU
+		// (image_useCompression is 0 there anyway): store it uncompressed
+		internalFormat = GL_RGBA8;
+	}
 	if ( level == 0 && ( face <= 0 ) ) {
 		AllocTexture( t, face >= 0, width, height, internalFormat );
 	}
-	if ( !t->allocated ) {
+	if ( !t->allocated || IsS3TCFormat( t->internalFormat ) ) {
 		return;
 	}
 	UploadLevel( t, level, face, 0, 0, width, height, format, pixels );
@@ -1822,6 +1902,67 @@ void APIENTRY glReadPixels( GLint x, GLint y, GLsizei width, GLsizei height, GLe
 
 ===============================================================================
 */
+
+// ARB_texture_compression with S3TC: the blocks are copied as they are (they're
+// little endian, like the GPU wants them) into a linear staging surface, then
+// GX2 copies that into the tiled texture
+static void APIENTRY gx2_glCompressedTexImage2DARB( GLenum target, GLint level, GLenum internalFormat, GLsizei width, GLsizei height,
+													GLint border, GLsizei imageSize, const GLvoid *data ) {
+	glTexture_t *t = BoundTexture( gl.activeUnit, GL_TEXTURE_2D );
+	if ( !t || !data || width <= 0 || height <= 0 || !IsS3TCFormat( internalFormat ) || target != GL_TEXTURE_2D ) {
+		return;
+	}
+	if ( level == 0 ) {
+		AllocTexture( t, false, width, height, internalFormat );
+	}
+	if ( !t->allocated || t->internalFormat != internalFormat || level >= (int)t->tex.surface.mipLevels ) {
+		return;
+	}
+
+	GX2Surface stage;
+	memset( &stage, 0, sizeof( stage ) );
+	stage.dim = GX2_SURFACE_DIM_TEXTURE_2D;
+	stage.width = width;
+	stage.height = height;
+	stage.depth = 1;
+	stage.mipLevels = 1;
+	stage.format = SurfaceFormat( internalFormat );
+	stage.aa = GX2_AA_MODE1X;
+	stage.use = GX2_SURFACE_USE_TEXTURE;
+	stage.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
+	GX2CalcSurfaceSizeAndAlignment( &stage );
+	stage.image = GX2GL_FrameAlloc( stage.imageSize, Max( (uint32_t)64, stage.alignment ) );
+
+	int blockBytes = ( internalFormat <= GL_COMPRESSED_RGBA_S3TC_DXT1_EXT ) ? 8 : 16;
+	int blocksWide = ( width + 3 ) / 4;
+	int blocksHigh = ( height + 3 ) / 4;
+	// for block compressed formats the pitch is in blocks
+	uint32_t rowBytes = stage.pitch * blockBytes;
+	if ( rowBytes < (uint32_t)( blocksWide * blockBytes ) || rowBytes * blocksHigh > stage.imageSize
+		|| blocksWide * blockBytes * blocksHigh > imageSize ) {
+		common->Warning( "GX2GL: unexpected layout for a %dx%d compressed texture (pitch %u, %u bytes)", width, height, stage.pitch, stage.imageSize );
+		return;
+	}
+	const byte *src = (const byte *)data;
+	for ( int row = 0; row < blocksHigh; row++ ) {
+		memcpy( (byte *)stage.image + row * rowBytes, src + row * blocksWide * blockBytes, blocksWide * blockBytes );
+	}
+	DCFlushRange( stage.image, stage.imageSize );
+
+	GX2CopySurface( &stage, 0, 0, &t->tex.surface, level, 0 );
+	GX2GL_RestoreState();
+	totalCompressedUploads++;
+
+	if ( level > t->maxLevel ) {
+		t->maxLevel = level;
+		t->samplerDirty = true;
+	}
+	stats.uploads++;
+}
+
+static void APIENTRY gx2_glGetCompressedTexImageARB( GLenum target, GLint level, GLvoid *img ) {
+	// only used to write .dds files, which isn't supported
+}
 
 static void APIENTRY gx2_glActiveTextureARB( GLenum texture ) {
 	gl.activeUnit = Min( (int)( texture - GL_TEXTURE0_ARB ), MAX_UNITS - 1 );
@@ -2003,6 +2144,8 @@ static const extProc_t extProcs[] = {
 	EXTPROC( glBufferSubDataARB ),
 	EXTPROC( glMapBufferARB ),
 	EXTPROC( glUnmapBufferARB ),
+	EXTPROC( glCompressedTexImage2DARB ),
+	EXTPROC( glGetCompressedTexImageARB ),
 	EXTPROC( glGenProgramsARB ),
 	EXTPROC( glBindProgramARB ),
 	EXTPROC( glProgramStringARB ),

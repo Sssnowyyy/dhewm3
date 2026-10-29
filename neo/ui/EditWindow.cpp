@@ -36,6 +36,10 @@ If you have questions concerning this license or the applicable additional terms
 
 #include "ui/EditWindow.h"
 
+#ifdef __WIIU__
+#include "sys/wiiu/wiiu_keyboard.h"
+#endif
+
 bool idEditWindow::ParseInternalVar( const char *_name, idParser *src ) {
 	if ( idStr::Icmp( _name, "maxchars" ) == 0) {
 		maxChars = src->ParseInt();
@@ -129,9 +133,30 @@ idEditWindow::~idEditWindow() {
 void idEditWindow::GainFocus() {
 	cursorPos = text.Length();
 	EnsureCursorVisible();
+#ifdef __WIIU__
+	// there's no keyboard, show the software keyboard; its text is picked up in Draw()
+	if ( !readonly ) {
+		WiiU_KeyboardOpen( this, text.c_str(), maxChars, numeric );
+	}
+#endif
 }
 
 void idEditWindow::Draw( int time, float x, float y ) {
+#ifdef __WIIU__
+	// text entered with the software keyboard, applied like typed text in HandleEvent()
+	idStr typed;
+	if ( WiiU_KeyboardPoll( this, typed ) ) {
+		if ( maxChars && typed.Length() > maxChars ) {
+			typed.CapLength( maxChars );
+		}
+		text = typed;
+		cursorPos = text.Length();
+		UpdateCvar( false );
+		RunScript( ON_ACTION );
+		EnsureCursorVisible();
+	}
+#endif
+
 	idVec4 color = foreColor;
 
 	UpdateCvar( true );

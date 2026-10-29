@@ -94,6 +94,10 @@ static voidpf ZCALLBACK fopen_file_func(voidpf opaque, const char* filename, int
 
     if ((filename!=NULL) && (mode_fopen != NULL))
         file = fopen(filename, mode_fopen);
+#ifdef __WIIU__
+    if (file != NULL)
+        setvbuf(file, NULL, _IOFBF, 64 * 1024);
+#endif
     return file;
 }
 
@@ -112,6 +116,12 @@ static voidpf ZCALLBACK fopen64_file_func(voidpf opaque, const void* filename, i
 
     if ((filename!=NULL) && (mode_fopen != NULL))
         file = FOPEN_FUNC((const char*)filename, mode_fopen);
+#ifdef __WIIU__
+    /* every read is a filesystem call to the SD/USB device, which is slow,
+       and newlib only buffers 1KB by default */
+    if (file != NULL)
+        setvbuf(file, NULL, _IOFBF, 64 * 1024);
+#endif
     return file;
 }
 

@@ -32,6 +32,7 @@ If you have questions concerning this license or the applicable additional terms
 #ifndef __GX2_LOCAL_H__
 #define __GX2_LOCAL_H__
 
+#include <coreinit/time.h>
 #include <gx2/context.h>
 #include <gx2/surface.h>
 
@@ -51,8 +52,12 @@ void	GX2GL_Init( void );
 void	GX2GL_Shutdown( void );
 // called after anything (clears, surface copies) that clobbered the GX2 state
 void	GX2GL_RestoreState( void );
-// called once per frame after the GPU finished it, frees per-frame memory
-void	GX2GL_EndFrame( void );
+// called once per frame after it was submitted (GX2Flush()), with the GPU timestamp
+// it will reach then. Switches to the next set of per-frame memory, which may mean
+// waiting for the GPU to finish the frame before
+void	GX2GL_EndFrame( OSTime submitted );
+// draws in the current frame so far
+int		GX2GL_FrameDraws( void );
 
 // per-frame scratch memory the GPU can read (vertex data for immediate mode,
 // expanded attributes, texture upload staging), valid until GX2GL_EndFrame()

@@ -2629,7 +2629,12 @@ void idSessionLocal::UpdateScreen( bool outOfSequence ) {
 	Draw();
 
 	D3P_BeginCPUSample(Render_EndFrame);
+#ifdef __WIIU__
+	// always: the Wii U port logs performance statistics (r_wiiuProfile)
+	if ( true ) {
+#else
 	if ( com_speeds.GetBool() ) {
+#endif
 		renderSystem->EndFrame( &time_frontend, &time_backend );
 	} else {
 		renderSystem->EndFrame( NULL, NULL );

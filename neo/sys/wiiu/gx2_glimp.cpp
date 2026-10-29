@@ -45,8 +45,12 @@ If you have questions concerning this license or the applicable additional terms
 
 #include "sys/platform.h"
 #include "renderer/tr_local.h"
+#include "framework/Common.h"
+
+extern idCVar com_speeds;
 
 #include "sys/wiiu/gx2_local.h"
+#include "sys/wiiu/wiiu_keyboard.h"
 
 GX2ColorBuffer		gx2ColorBuffer;
 GX2DepthBuffer		gx2DepthBuffer;
@@ -63,10 +67,16 @@ static bool			gx2Initialized;
 static bool			displaysEnabled;
 static glimpParms_t	curParms;
 
+// the GamePad's own buffer while the software keyboard is open (DrawKeyboardDRC())
+static GX2ColorBuffer		drcColorBuffer;
+static GX2DepthBuffer		drcDepthBuffer;
+static GX2ContextState *	drcContextState;
+
 static const GX2TVRenderMode TV_RENDER_MODE = GX2_TV_RENDER_MODE_WIDE_720P;
 static const GX2SurfaceFormat SCAN_FORMAT = GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8;
 
-idCVar r_gx2Test( "r_gx2Test", "0", CVAR_RENDERER | CVAR_INTEGER, "debug: 1: draw a test pattern on top of every frame, 2: show the captured (packed) depth texture, 3: show a white texture instead" );
+idCVar r_wiiuProfile( "r_wiiuProfile", "5", CVAR_RENDERER | CVAR_INTEGER, "log performance statistics every N seconds (0 = never)" );
+idCVar r_gx2Test( "r_gx2Test", "0", CVAR_RENDERER | CVAR_INTEGER, "debug: 1: draw a test pattern on top of every frame, 2: show the captured (packed) depth texture, 3: show a white texture instead, 7: open the software keyboard" );
 // NOTE: doesn't work in Cemu, which doesn't write GPU rendered surfaces back to emulated memory
 idCVar r_gx2DumpFrame( "r_gx2DumpFrame", "0", CVAR_RENDERER | CVAR_INTEGER, "debug: write frame N to dhewm3frame.tga on the SD card" );
 
@@ -210,6 +220,13 @@ void GLimp_Shutdown( void ) {
 		return;
 	}
 	GX2GL_Shutdown();
+	WiiU_KeyboardShutdown();
+	if ( drcContextState ) {
+		free( drcColorBuffer.surface.image );
+		free( drcDepthBuffer.surface.image );
+		free( drcContextState );
+		drcContextState = NULL;
+	}
 	GX2SetTVEnable( FALSE );
 	GX2SetDRCEnable( FALSE );
 	ReleaseForeground( NULL );
@@ -283,12 +300,118 @@ static void DumpFrame( void ) {
 	free( lin.image );
 }
 
+/*
+===============
+Software keyboard on the GamePad
+
+While the keyboard is open, the GamePad shows just the keyboard, drawn at its
+native resolution into its own buffer, so touching the keys works.
+===============
+*/
+static void DrawKeyboardDRC( void ) {
+	if ( !drcContextState ) {
+		memset( &drcColorBuffer, 0, sizeof( drcColorBuffer ) );
+		drcColorBuffer.surface = gx2ColorBuffer.surface;
+		drcColorBuffer.surface.width = 854;
+		drcColorBuffer.surface.height = 480;
+		drcColorBuffer.surface.image = NULL;
+		drcColorBuffer.viewNumSlices = 1;
+		AllocSurface( drcColorBuffer.surface );
+		GX2InitColorBufferRegs( &drcColorBuffer );
+
+		memset( &drcDepthBuffer, 0, sizeof( drcDepthBuffer ) );
+		drcDepthBuffer.surface = gx2DepthBuffer.surface;
+		drcDepthBuffer.surface.width = 854;
+		drcDepthBuffer.surface.height = 480;
+		drcDepthBuffer.surface.image = NULL;
+		drcDepthBuffer.viewNumSlices = 1;
+		drcDepthBuffer.depthClear = 1.0f;
+		AllocSurface( drcDepthBuffer.surface );
+		GX2InitDepthBufferRegs( &drcDepthBuffer );
+
+		drcContextState = (GX2ContextState *)memalign( GX2_CONTEXT_STATE_ALIGNMENT, sizeof( GX2ContextState ) );
+		GX2SetupContextStateEx( drcContextState, TRUE );
+		GX2SetContextState( drcContextState );
+		GX2SetColorBuffer( &drcColorBuffer, GX2_RENDER_TARGET_0 );
+		GX2SetDepthBuffer( &drcDepthBuffer );
+		GX2SetViewport( 0, 0, 854, 480, 0.0f, 1.0f );
+		GX2SetScissor( 0, 0, 854, 480 );
+	}
+	GX2ClearColor( &drcColorBuffer, 0.0f, 0.0f, 0.0f, 1.0f );
+	GX2ClearDepthStencilEx( &drcDepthBuffer, 1.0f, 0, GX2_CLEAR_FLAGS_BOTH );
+	GX2SetContextState( drcContextState );
+	WiiU_KeyboardDrawDRC();
+	GX2CopyColorBufferToScanBuffer( &drcColorBuffer, GX2_SCAN_TARGET_DRC );
+	GX2GL_RestoreState();
+}
+
+/*
+===============
+Profiling
+
+Every r_wiiuProfile seconds, logs where the time of the average frame went:
+game logic, the renderer's frontend (culling, interactions, shadow volumes) and
+backend (issuing the draws), and waiting for the GPU. If the GPU wait is small,
+the CPU is the bottleneck.
+===============
+*/
+static struct {
+	double	periodStart;
+	double	lastSwap;
+	int		frames;
+	double	frameMs, worstFrameMs, gpuWaitMs;
+	int		gameMs, frontendMs, backendMs, draws;
+} prof;
+
+static void ProfileFrame( double gpuWaitMs, int draws ) {
+	double now = Sys_MillisecondsPrecise();
+	if ( prof.lastSwap > 0.0 ) {
+		double frameMs = now - prof.lastSwap;
+		prof.frameMs += frameMs;
+		prof.worstFrameMs = Max( prof.worstFrameMs, frameMs );
+		prof.frames++;
+	}
+	prof.lastSwap = now;
+	prof.gpuWaitMs += gpuWaitMs;
+	prof.draws += draws;
+	// time_frontend / time_backend are set every frame on the Wii U (Session.cpp),
+	// time_gameFrame adds up and is reset by com_speeds if that's on
+	prof.gameMs += time_gameFrame;
+	prof.frontendMs += time_frontend;
+	prof.backendMs += time_backend;
+	if ( !com_speeds.GetBool() ) {
+		time_gameFrame = 0;
+	}
+
+	int interval = r_wiiuProfile.GetInteger();
+	if ( interval <= 0 ) {
+		memset( &prof, 0, sizeof( prof ) );
+		prof.lastSwap = now;
+		return;
+	}
+	if ( prof.periodStart <= 0.0 ) {
+		prof.periodStart = now;
+	}
+	double elapsed = now - prof.periodStart;
+	if ( elapsed >= interval * 1000.0 && prof.frames > 0 ) {
+		float n = prof.frames;
+		common->Printf( "Wii U perf: %.1f fps | frame avg %.1f ms, worst %.0f ms | game %.1f, render frontend %.1f, backend %.1f, GPU wait %.1f ms | %.0f draws\n",
+			prof.frames * 1000.0 / elapsed, prof.frameMs / n, prof.worstFrameMs,
+			prof.gameMs / n, prof.frontendMs / n, prof.backendMs / n, prof.gpuWaitMs / n, prof.draws / n );
+		double last = prof.lastSwap;
+		memset( &prof, 0, sizeof( prof ) );
+		prof.lastSwap = last;
+		prof.periodStart = now;
+	}
+}
+
 void GLimp_SwapBuffers( void ) {
 	if ( !gx2Initialized ) {
 		return;
 	}
+	int draws = GX2GL_FrameDraws();
 	if ( gx2Foreground ) {
-		if ( r_gx2Test.GetInteger() ) {
+		if ( r_gx2Test.GetInteger() >= 1 && r_gx2Test.GetInteger() <= 3 ) {
 			GX2GL_DrawTestPattern( r_gx2Test.GetInteger() );
 		}
 		static int frameNum;
@@ -296,15 +419,31 @@ void GLimp_SwapBuffers( void ) {
 			DumpFrame();
 		}
 
+		if ( r_gx2Test.GetInteger() == 7 ) {
+			static int dummyOwner;
+			WiiU_KeyboardOpen( &dummyOwner, "Doom 3", 20, false );
+		}
+
+		WiiU_KeyboardUpdate();
+		bool keyboard = WiiU_KeyboardVisible();
+		if ( keyboard ) {
+			WiiU_KeyboardDrawTV();
+			GX2GL_RestoreState();
+		}
 		GX2CopyColorBufferToScanBuffer( &gx2ColorBuffer, GX2_SCAN_TARGET_TV );
-		GX2CopyColorBufferToScanBuffer( &gx2ColorBuffer, GX2_SCAN_TARGET_DRC );
+		if ( keyboard ) {
+			DrawKeyboardDRC();
+		} else {
+			GX2CopyColorBufferToScanBuffer( &gx2ColorBuffer, GX2_SCAN_TARGET_DRC );
+		}
 		GX2SwapScanBuffers();
 		GX2Flush();
 	}
 
-	// keep the CPU and GPU in lockstep for now, so per-frame memory can simply be reused
-	GX2DrawDone();
-	GX2GL_EndFrame();
+	// switches to the next set of per-frame memory, waiting for the GPU if necessary
+	double waitStart = Sys_MillisecondsPrecise();
+	GX2GL_EndFrame( GX2GetLastSubmittedTimeStamp() );
+	ProfileFrame( Sys_MillisecondsPrecise() - waitStart, draws );
 	GX2GL_RestoreState();
 
 	if ( gx2Foreground && !displaysEnabled ) {
