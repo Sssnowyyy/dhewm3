@@ -24,6 +24,7 @@ extern wiiuLoadProfile_t wiiuLoadProfile;
 // see wiiu_main.cpp
 bool	Wiiu_FileMayExist( const char *path );
 void	Wiiu_LogEveryLine( void );
+bool	Wiiu_IgnorePk4sIn( const char *path );
 
 // memory use, from malloc()'s point of view (the GPU's memory comes from there too)
 int		Wiiu_MemoryUsedMB( void );

@@ -2132,6 +2132,11 @@ void idFileSystemLocal::AddGameDirectory( const char *path, const char *dir ) {
 	pakfile[ pakfile.Length() - 1 ] = 0;	// strip the trailing slash
 
 	ListOSFiles( pakfile, ".pk4", pakfiles );
+#ifdef __WIIU__
+	if ( Wiiu_IgnorePk4sIn( path ) ) {
+		pakfiles.Clear();
+	}
+#endif
 
 	// sort them so that later alphabetic matches override
 	// earlier ones. This makes pak1.pk4 override pak0.pk4

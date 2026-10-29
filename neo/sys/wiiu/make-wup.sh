@@ -9,11 +9,24 @@
 #   package's title key and isn't printed or stored anywhere else.
 #
 # Output: build-wiiu/wup/out, copy it to sd:/install/<some folder>/
+#
+# make-wup.sh --kit <dir> makes a folder to pack a title that has the game data
+# installed with it instead: put the .pk4s in <dir>/in/content/base/ and run
+# <dir>/pack.sh (see wup/pack.sh). The game finds them in /vol/content/base/.
 set -e
 cd "$(dirname "$0")/../../.."
 
+KIT=""
+if [ "$1" = "--kit" ]; then
+	KIT="$2"
+	if [ -z "$KIT" ] || [ -e "$KIT" ]; then
+		echo "usage: $0 --kit <new folder>"
+		exit 1
+	fi
+fi
+
 KEYSRC="$1"
-if [ -z "$KEYSRC" ] || [ ! -f "$KEYSRC" ]; then
+if [ -z "$KIT" ] && { [ -z "$KEYSRC" ] || [ ! -f "$KEYSRC" ]; }; then
 	echo "usage: $0 <otp.bin or file with the common key>"
 	exit 1
 fi
@@ -52,6 +65,18 @@ echo "Doom 3 (dhewm3) loads its data from sd:/wiiu/apps/dhewm3/base/" > "$WUP/in
 
 if [ ! -f build-wiiu/tools/NUSPacker.jar ]; then
 	curl -fL -o build-wiiu/tools/NUSPacker.jar "$NUSPACKER_URL"
+fi
+
+if [ -n "$KIT" ]; then
+	mkdir -p "$KIT/tools"
+	cp -R "$WUP/in" "$KIT/"
+	rm "$KIT/in/content/readme.txt"
+	echo "Doom 3 (dhewm3): the game data is in base/, config and savegames are on the SD card in sd:/wiiu/apps/dhewm3/" > "$KIT/in/content/readme.txt"
+	mkdir -p "$KIT/in/content/base"
+	cp build-wiiu/tools/NUSPacker.jar "$KIT/tools/"
+	cp "$SRC/wup/pack.sh" "$KIT/"
+	echo "Done: put pak000.pk4 ... pak008.pk4 into $KIT/in/content/base/ and run $KIT/pack.sh"
+	exit 0
 fi
 
 # NUSPacker reads the key from a file "encryptKeyWith" in the current directory

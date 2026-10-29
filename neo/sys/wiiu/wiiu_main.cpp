@@ -59,6 +59,26 @@ If you have questions concerning this license or the applicable additional terms
 //   sd:/wiiu/apps/dhewm3/base/pak000.pk4 ...
 #define WIIU_DATA_PATH "fs:/vol/external01/wiiu/apps/dhewm3"
 
+// when Doom 3 is installed as a title with the game data in its content
+// (content/base/pak000.pk4 ...), the .pk4s are loaded from there instead, the
+// config and savegames stay on the SD card
+#define WIIU_CONTENT_PATH "fs:/vol/content"
+
+static bool Wiiu_InstalledData( void ) {
+	static int installed = -1;
+	if ( installed < 0 ) {
+		struct stat st;
+		installed = stat( WIIU_CONTENT_PATH "/" BASE_GAMEDIR "/pak000.pk4", &st ) == 0;
+	}
+	return installed != 0;
+}
+
+// the .pk4s on the SD card aren't used when the installed ones are (otherwise
+// they'd be found first, the save path is searched before the base path)
+bool Wiiu_IgnorePk4sIn( const char *path ) {
+	return Wiiu_InstalledData() && idStr::Icmp( path, WIIU_DATA_PATH ) == 0;
+}
+
 wiiuLoadProfile_t wiiuLoadProfile;
 
 
@@ -121,8 +141,13 @@ bool Wiiu_FileMayExist( const char *path ) {
 	if ( numKnownDirs < 0 ) {
 		numKnownDirs = 0;
 		ScanKnownDirs( WIIU_DATA_PATH, 0 );
+		if ( Wiiu_InstalledData() ) {
+			ScanKnownDirs( WIIU_CONTENT_PATH, 0 );
+		}
 	}
-	if ( numKnownDirs > MAX_KNOWN_DIRS || idStr::Icmpn( path, WIIU_DATA_PATH "/", strlen( WIIU_DATA_PATH ) + 1 ) != 0 ) {
+	bool known = idStr::Icmpn( path, WIIU_DATA_PATH "/", strlen( WIIU_DATA_PATH ) + 1 ) == 0
+		|| ( Wiiu_InstalledData() && idStr::Icmpn( path, WIIU_CONTENT_PATH "/", strlen( WIIU_CONTENT_PATH ) + 1 ) == 0 );
+	if ( numKnownDirs > MAX_KNOWN_DIRS || !known ) {
 		return true;
 	}
 	const char *slash = strrchr( path, '/' );
@@ -282,6 +307,8 @@ int Sys_ListFiles( const char *directory, const char *extension, idStrList &list
 bool Sys_GetPath( sysPath_t type, idStr &path ) {
 	switch ( type ) {
 	case PATH_BASE:
+		path = Wiiu_InstalledData() ? WIIU_CONTENT_PATH : WIIU_DATA_PATH;
+		return true;
 	case PATH_CONFIG:
 	case PATH_SAVE:
 		path = WIIU_DATA_PATH;
@@ -301,6 +328,8 @@ void Sys_Init( void ) {
 
 	com_pid.SetInteger( 0 );
 	common->Printf( "%d MB System Memory\n", Sys_GetSystemRam() );
+	common->Printf( "Game data (.pk4 files): %s\n", Wiiu_InstalledData() ? "installed with the title, in " WIIU_CONTENT_PATH "/" BASE_GAMEDIR
+		: "on the SD card, in " WIIU_DATA_PATH "/" BASE_GAMEDIR );
 }
 
 void Sys_Shutdown( void ) {
