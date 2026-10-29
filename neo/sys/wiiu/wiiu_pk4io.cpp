@@ -33,12 +33,18 @@ If you have questions concerning this license or the applicable additional terms
 // to IOSU and the SD card / USB drive, which takes milliseconds, so a level load
 // spent minutes on them. Here every .pk4 is opened once and shared by all
 // streams, and reads go through a small cache of large blocks.
+//
+// The blocks are cache line aligned, so the filesystem DMAs straight into them
+// without going through the CPU cache - which has to be flushed before and
+// invalidated after, or the CPU sees what was in the block before. Cemu doesn't
+// emulate the CPU cache, so that only shows on a real Wii U.
 
 #include <fcntl.h>
 #include <unistd.h>
 #include <malloc.h>
 #include <string.h>
 
+#include <coreinit/cache.h>
 #include <coreinit/mutex.h>
 
 #include "sys/platform.h"
@@ -117,9 +123,12 @@ static pk4Block_t *GetBlock( pk4Source_t *src, int64_t offset ) {
 	}
 	int length = (int)Min( (int64_t)BLOCK_SIZE, src->size - offset );
 	oldest->offset = offset;
-	oldest->length = ReadAt( src, offset, oldest->data, length );
+	DCFlushRange( oldest->data, BLOCK_SIZE );
+	// whole cache lines, so the filesystem never has to split the read
+	oldest->length = ReadAt( src, offset, oldest->data, ( length + 63 ) & ~63 );
+	DCInvalidateRange( oldest->data, BLOCK_SIZE );
 	oldest->lastUse = ++src->useCounter;
-	if ( oldest->length != length ) {
+	if ( oldest->length < length ) {
 		oldest->offset = -1;
 		return NULL;
 	}
@@ -179,25 +188,13 @@ static uLong ZCALLBACK pk4_read( voidpf opaque, voidpf _stream, void *buf, uLong
 		int inBlock = (int)( stream->pos - blockOffset );
 		int want = (int)Min( (int64_t)( size - done ), src->size - stream->pos );
 
-		// large reads that start at a block boundary skip the cache
-		if ( inBlock == 0 && want >= BLOCK_SIZE ) {
-			int n = want & ~( BLOCK_SIZE - 1 );
-			int got = ReadAt( src, stream->pos, dest + done, n );
-			done += got;
-			stream->pos += got;
-			if ( got != n ) {
-				stream->error = true;
-				break;
-			}
-			continue;
-		}
-
+		// everything goes through the blocks, so only they need the cache handling above
 		pk4Block_t *b = GetBlock( src, blockOffset );
 		if ( !b ) {
 			stream->error = true;
 			break;
 		}
-		int n = Min( want, b->length - inBlock );
+		int n = Min( want, (int)Min( (int64_t)b->length, src->size - blockOffset ) - inBlock );
 		memcpy( dest + done, b->data + inBlock, n );
 		done += n;
 		stream->pos += n;
