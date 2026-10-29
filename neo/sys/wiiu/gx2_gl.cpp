@@ -2002,7 +2002,11 @@ static void UploadLevel( glTexture_t *t, int level, int face, int x, int y, int 
 				break;
 		}
 	}
+	// GX2CopySurface() reads the staging memory through the GPU's texture cache,
+	// which may still hold what an earlier upload put there (a real Wii U shows
+	// that as blocks of garbage in the texture, Cemu doesn't emulate the cache)
 	DCFlushRange( stage.image, stage.imageSize );
+	GX2Invalidate( GX2_INVALIDATE_MODE_TEXTURE, stage.image, stage.imageSize );
 
 	if ( x == 0 && y == 0 ) {
 		GX2CopySurface( &stage, 0, 0, &t->tex.surface, level, Max( face, 0 ) );
@@ -2186,10 +2190,15 @@ static void APIENTRY gx2_glCompressedTexImage2DARB( GLenum target, GLint level, 
 	for ( int row = 0; row < blocksHigh; row++ ) {
 		memcpy( (byte *)stage.image + row * rowBytes, src + row * blocksWide * blockBytes, blocksWide * blockBytes );
 	}
+	// GX2CopySurface() reads the staging memory through the GPU's texture cache,
+	// which may still hold what an earlier upload put there (a real Wii U shows
+	// that as blocks of garbage in the texture, Cemu doesn't emulate the cache)
 	DCFlushRange( stage.image, stage.imageSize );
+	GX2Invalidate( GX2_INVALIDATE_MODE_TEXTURE, stage.image, stage.imageSize );
 
 	GX2CopySurface( &stage, 0, 0, &t->tex.surface, level, 0 );
 	GX2GL_RestoreState();
+	GX2Invalidate( GX2_INVALIDATE_MODE_TEXTURE, t->tex.surface.image, t->tex.surface.imageSize + t->tex.surface.mipmapSize );
 	totalCompressedUploads++;
 
 	if ( level > t->maxLevel ) {

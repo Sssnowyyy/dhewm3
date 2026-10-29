@@ -176,7 +176,11 @@ static int RenderThreadMain( int argc, const char **argv ) {
 			break;
 		}
 		try {
-			RB_ExecuteBackEndCommands( (const emptyCommand_t *)renderCmds );
+			// once ProcUI said we're exiting the GPU isn't ours anymore, drawing
+			// could wait forever
+			if ( procRunning ) {
+				RB_ExecuteBackEndCommands( (const emptyCommand_t *)renderCmds );
+			}
 		} catch ( std::exception & ) {
 			// common->Error() in the back end, nothing on this thread can handle it
 		} catch ( ... ) {
@@ -191,16 +195,105 @@ static int RenderThreadMain( int argc, const char **argv ) {
 	return 0;
 }
 
-static void MoveToCore( int core ) {
-	OSThread *self = OSGetCurrentThread();
-	OSSetThreadAffinity( self, 1 << core );
-	for ( int i = 0; i < 10000 && OSGetCoreId() != (uint32_t)core; i++ ) {
-		OSYieldThread();
+/*
+Moving the engine thread between cores: a running thread that changes its own
+affinity stays on its core on a real Wii U (in Cemu it moves). Each thread has a
+place in the run queue of every core, though, so a helper thread changes the
+affinity while the engine thread waits for it, and the engine thread continues
+on the new core when it wakes up.
+*/
+#define MOVER_STACK_SIZE	( 16 * 1024 )
+static OSThread *			moverThread;
+static uint8_t *			moverStack;
+static OSEvent				moveRequest, moveDone;
+static OSThread * volatile	moveTarget;
+static volatile uint32_t	moveAffinity;
+static bool					movesFailed;		// stay on GX2_CORE then
+static int					moves, failedMoves;	// for the perf line
+static volatile uint32_t	engineCore = GX2_CORE;
+
+static int MoverThreadMain( int argc, const char **argv ) {
+	while ( true ) {
+		OSWaitEvent( &moveRequest );
+		OSThread *target = moveTarget;
+		if ( !target ) {
+			break;
+		}
+		// wait until it's really waiting for us (sleeping, not spinning: other
+		// threads of the system run on this core)
+		for ( int i = 0; i < 200 && target->state != OS_THREAD_STATE_WAITING; i++ ) {
+			OSSleepTicks( OSMicrosecondsToTicks( 20 ) );
+		}
+		OSSetThreadAffinity( target, moveAffinity );
+		OSSignalEvent( &moveDone );
 	}
-	static bool warned;
-	if ( OSGetCoreId() != (uint32_t)core && !warned ) {
-		warned = true;
-		common->Printf( "WARNING: the engine thread couldn't move to CPU%d\n", core );
+	return 0;
+}
+
+static bool MoveToCore( int core ) {
+	if ( OSGetCoreId() == (uint32_t)core ) {
+		return true;
+	}
+	if ( moverThread ) {
+		moveTarget = OSGetCurrentThread();
+		moveAffinity = 1 << core;
+		OSSignalEvent( &moveRequest );
+		OSWaitEvent( &moveDone );
+	} else {
+		OSSetThreadAffinity( OSGetCurrentThread(), 1 << core );
+	}
+	for ( int i = 0; i < 100 && OSGetCoreId() != (uint32_t)core; i++ ) {
+		OSSleepTicks( OSMicrosecondsToTicks( 50 ) );
+	}
+	if ( OSGetCoreId() != (uint32_t)core ) {
+		failedMoves++;
+		if ( !movesFailed ) {
+			common->Printf( "WARNING: the engine thread couldn't move from CPU%u to CPU%d\n", OSGetCoreId(), core );
+		}
+		return false;
+	}
+	moves++;
+	engineCore = core;
+	return true;
+}
+
+static void StartMoverThread( void ) {
+	OSInitEvent( &moveRequest, FALSE, OS_EVENT_MODE_AUTO );
+	OSInitEvent( &moveDone, FALSE, OS_EVENT_MODE_AUTO );
+	OSThread *thread = (OSThread *)memalign( 16, sizeof( OSThread ) );
+	moverStack = (uint8_t *)memalign( 16, MOVER_STACK_SIZE );
+	if ( !thread || !moverStack || !OSCreateThread( thread, MoverThreadMain, 0, NULL, moverStack + MOVER_STACK_SIZE,
+			MOVER_STACK_SIZE, OSGetThreadPriority( OSGetCurrentThread() ), OS_THREAD_ATTRIB_AFFINITY_CPU0 ) ) {
+		free( thread );
+		free( moverStack );
+		moverStack = NULL;
+		return;
+	}
+	OSSetThreadName( thread, "dhewm3 core mover" );
+	moverThread = thread;
+	OSResumeThread( thread );
+}
+
+static void StopMoverThread( void ) {
+	if ( !moverThread ) {
+		return;
+	}
+	moveTarget = NULL;
+	OSSignalEvent( &moveRequest );
+	int result;
+	OSJoinThread( moverThread, &result );
+	free( moverThread );
+	free( moverStack );
+	moverThread = NULL;
+	moverStack = NULL;
+}
+
+// the engine thread back on GX2_CORE, which it really has to be on
+static void ReturnToGX2Core( void ) {
+	for ( int i = 0; i < 10 && !MoveToCore( GX2_CORE ); i++ ) {
+	}
+	if ( OSGetCoreId() != GX2_CORE ) {
+		common->Printf( "WARNING: the engine thread is stuck on CPU%u, expect trouble\n", OSGetCoreId() );
 	}
 }
 
@@ -228,6 +321,7 @@ static void StartRenderThread( void ) {
 	gx2RenderThread = thread;
 	mainThreadOwnsGX2 = true;
 	OSResumeThread( thread );
+	StartMoverThread();
 }
 
 static void StopRenderThread( void ) {
@@ -243,6 +337,7 @@ static void StopRenderThread( void ) {
 	free( renderThreadStack );
 	gx2RenderThread = NULL;
 	renderThreadStack = NULL;
+	StopMoverThread();
 }
 
 void WiiU_SyncRenderThreadFor( const char *reason ) {
@@ -250,7 +345,7 @@ void WiiU_SyncRenderThreadFor( const char *reason ) {
 		return;
 	}
 	WaitRenderIdle();
-	MoveToCore( GX2_CORE );
+	ReturnToGX2Core();
 	mainThreadOwnsGX2 = true;
 	renderSyncs++;
 	lastSyncReason = reason;
@@ -271,6 +366,9 @@ void WiiU_ExecuteBackEnd( const void *cmds, bool async ) {
 		return;
 	}
 	WaitRenderIdle();
+	if ( !procRunning ) {
+		return;		// exiting, see RenderThreadMain()
+	}
 	OSResetEvent( &renderIdle );
 	renderCmds = cmds;
 	OSSignalEvent( &renderWork );
@@ -278,14 +376,17 @@ void WiiU_ExecuteBackEnd( const void *cmds, bool async ) {
 	if ( !async || !r_wiiuRenderThread.GetBool() ) {
 		WaitRenderIdle();
 		if ( !mainThreadOwnsGX2 ) {
-			MoveToCore( GX2_CORE );
+			ReturnToGX2Core();
 			mainThreadOwnsGX2 = true;
 		}
 		return;
 	}
 	if ( mainThreadOwnsGX2 ) {
 		mainThreadOwnsGX2 = false;
-		MoveToCore( GAME_CORE );
+		if ( !movesFailed && !MoveToCore( GAME_CORE ) ) {
+			// stay on GX2_CORE, sharing it with the render thread
+			movesFailed = true;
+		}
 	}
 }
 
@@ -573,6 +674,8 @@ static void ProfileFrame( double gpuWaitMs, int draws ) {
 			prof.frames * 1000.0 / elapsed, prof.frameMs / n, prof.worstFrameMs,
 			prof.gameMs / n, prof.frontendMs / n, prof.backendMs / n, prof.gpuWaitMs / n, prof.draws / n, Wiiu_MemoryUsedMB(),
 			renderWaitMs / n, renderSyncs, lastSyncReason ? lastSyncReason : "-" );
+		common->Printf( "Wii U threads: engine thread on CPU%u, %d core moves, %d failed\n", engineCore, moves, failedMoves );
+		moves = failedMoves = 0;
 		renderWaitMs = 0.0;
 		renderSyncs = 0;
 		lastSyncReason = NULL;
