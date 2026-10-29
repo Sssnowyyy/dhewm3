@@ -39,6 +39,11 @@ If you have questions concerning this license or the applicable additional terms
 
 #include "renderer/tr_local.h"
 
+#ifdef __WIIU__
+#include "sys/wiiu/wiiu_renderthread.h"
+extern frameData_t *wiiuBackEndFrameData;
+#endif
+
 //====================================================================
 
 /*
@@ -183,7 +188,27 @@ void R_ShowColoredScreenRect( const idScreenRect &rect, int colorIndex ) {
 R_ToggleSmpFrame
 ====================
 */
+#ifdef __WIIU__
+// the Wii U runs the back end on another thread while the front end works on
+// the next frame (see sys/wiiu/gx2_glimp.cpp), which needs two sets of frame
+// data - like when the original engine ran r_smp
+#define NUM_FRAME_DATA	2
+#else
+#define NUM_FRAME_DATA	1
+#endif
+static frameData_t *	smpFrameData[NUM_FRAME_DATA];
+static int				smpFrame;
+
 void R_ToggleSmpFrame( void ) {
+	smpFrame++;
+	frameData = smpFrameData[smpFrame % NUM_FRAME_DATA];
+#ifdef __WIIU__
+	// only happens if this was called again before the next frame was issued
+	if ( frameData == wiiuBackEndFrameData ) {
+		WiiU_SyncRenderThread();
+	}
+#endif
+
 	R_FreeDeferredTriSurfs( frameData );
 
 	// clear frame-temporary data
@@ -220,20 +245,23 @@ void R_ShutdownFrameData( void ) {
 	frameData_t *frame;
 	frameMemoryBlock_t *block;
 
-	// free any current data
-	frame = frameData;
-	if ( !frame ) {
-		return;
-	}
+	for ( int i = 0; i < NUM_FRAME_DATA; i++ ) {
+		// free any current data
+		frame = smpFrameData[i];
+		if ( !frame ) {
+			continue;
+		}
 
-	R_FreeDeferredTriSurfs( frame );
+		R_FreeDeferredTriSurfs( frame );
 
-	frameMemoryBlock_t *nextBlock;
-	for ( block = frame->memory ; block ; block = nextBlock ) {
-		nextBlock = block->next;
-		Mem_Free( block );
+		frameMemoryBlock_t *nextBlock;
+		for ( block = frame->memory ; block ; block = nextBlock ) {
+			nextBlock = block->next;
+			Mem_Free( block );
+		}
+		Mem_Free( frame );
+		smpFrameData[i] = NULL;
 	}
-	Mem_Free( frame );
 	frameData = NULL;
 }
 
@@ -249,18 +277,21 @@ void R_InitFrameData( void ) {
 
 	R_ShutdownFrameData();
 
-	frameData = (frameData_t *)Mem_ClearedAlloc( sizeof( *frameData ));
-	frame = frameData;
-	size = MEMORY_BLOCK_SIZE;
-	block = (frameMemoryBlock_t *)Mem_Alloc( size + sizeof( *block ) );
-	if ( !block ) {
-		common->FatalError( "R_InitFrameData: Mem_Alloc() failed" );
+	for ( int i = 0; i < NUM_FRAME_DATA; i++ ) {
+		frame = (frameData_t *)Mem_ClearedAlloc( sizeof( *frame ));
+		size = MEMORY_BLOCK_SIZE;
+		block = (frameMemoryBlock_t *)Mem_Alloc( size + sizeof( *block ) );
+		if ( !block ) {
+			common->FatalError( "R_InitFrameData: Mem_Alloc() failed" );
+		}
+		block->size = size;
+		block->used = 0;
+		block->next = NULL;
+		frame->memory = block;
+		frame->memoryHighwater = 0;
+		smpFrameData[i] = frame;
 	}
-	block->size = size;
-	block->used = 0;
-	block->next = NULL;
-	frame->memory = block;
-	frame->memoryHighwater = 0;
+	frameData = smpFrameData[0];
 
 	R_ToggleSmpFrame();
 }

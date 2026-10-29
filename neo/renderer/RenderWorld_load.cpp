@@ -32,6 +32,9 @@ If you have questions concerning this license or the applicable additional terms
 #include "renderer/RenderWorld_local.h"
 
 #include "renderer/tr_local.h"
+#ifdef __WIIU__
+#include "sys/wiiu/wiiu_renderthread.h"
+#endif
 
 /*
 ================
@@ -39,6 +42,9 @@ idRenderWorldLocal::FreeWorld
 ================
 */
 void idRenderWorldLocal::FreeWorld() {
+#ifdef __WIIU__
+	WiiU_SyncRenderThread();	// the back end may still be drawing it
+#endif
 	int i;
 
 	// this will free all the lightDefs and entityDefs

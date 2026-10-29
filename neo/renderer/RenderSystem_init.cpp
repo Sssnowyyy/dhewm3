@@ -40,6 +40,10 @@ If you have questions concerning this license or the applicable additional terms
 
 #include "renderer/tr_local.h"
 
+#ifdef __WIIU__
+#include "sys/wiiu/wiiu_renderthread.h"
+#endif
+
 #include "framework/GameCallbacks_local.h"
 #include "framework/Game.h"
 
@@ -2437,6 +2441,9 @@ idRenderSystemLocal::BeginLevelLoad
 ========================
 */
 void idRenderSystemLocal::BeginLevelLoad( void ) {
+#ifdef __WIIU__
+	WiiU_SyncRenderThread();
+#endif
 	renderModelManager->BeginLevelLoad();
 	globalImages->BeginLevelLoad();
 }
@@ -2447,6 +2454,9 @@ idRenderSystemLocal::EndLevelLoad
 ========================
 */
 void idRenderSystemLocal::EndLevelLoad( void ) {
+#ifdef __WIIU__
+	WiiU_SyncRenderThread();
+#endif
 	renderModelManager->EndLevelLoad();
 	globalImages->EndLevelLoad();
 	if ( r_forceLoadImages.GetBool() ) {

@@ -53,6 +53,7 @@ If you have questions concerning this license or the applicable additional terms
 #include "sys/sys_local.h"
 #include "sys/sys_sdl.h"
 #include "sys/wiiu/wiiu_loadprofile.h"
+#include "sys/wiiu/wiiu_renderthread.h"
 
 // game data, config and savegames all live here on the SD card:
 //   sd:/wiiu/apps/dhewm3/base/pak000.pk4 ...
@@ -495,6 +496,10 @@ static int EngineThreadMain( int argc, const char **argv ) {
 		"+set", "image_usePrecompressedTextures", "1",
 		"+set", "image_useNormalCompression", "2",
 		"+set", "image_useCompression", "0",
+		// indexes in buffers the GPU reads directly, instead of copying them for
+		// every draw - and the front end can change them while the render thread
+		// (gx2_glimp.cpp) still draws the frame before
+		"+set", "r_useIndexBuffers", "1",
 	};
 	static char *args[64];
 	int numArgs = 0;
@@ -529,7 +534,7 @@ static int EngineThreadMain( int argc, const char **argv ) {
 
 	common->Init( numArgs, args );
 
-	while ( WHBProcIsRunning() ) {
+	while ( WiiU_ProcIsRunning() ) {
 		common->Frame();
 	}
 

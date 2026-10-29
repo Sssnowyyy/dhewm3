@@ -174,6 +174,10 @@ void idVertexCache::Init() {
 	freeDynamicHeaders.next = freeDynamicHeaders.prev = &freeDynamicHeaders;
 	dynamicHeaders.next = dynamicHeaders.prev = &dynamicHeaders;
 	deferredFreeList.next = deferredFreeList.prev = &deferredFreeList;
+#ifdef __WIIU__
+	olderDeferredFreeList.next = olderDeferredFreeList.prev = &olderDeferredFreeList;
+	olderDynamicHeaders.next = olderDynamicHeaders.prev = &olderDynamicHeaders;
+#endif
 
 	// set up the dynamic frame memory
 	frameBytes = FRAME_MEMORY_BYTES;
@@ -207,6 +211,26 @@ void idVertexCache::PurgeAll() {
 		ActuallyFree( staticHeaders.next );
 	}
 }
+
+#ifdef __WIIU__
+/*
+===========
+MoveList
+
+moves all blocks of the doubly linked list "from" to the front of "to"
+===========
+*/
+void idVertexCache::MoveList( vertCache_t &from, vertCache_t &to ) {
+	if ( from.next == &from ) {
+		return;
+	}
+	from.next->prev = &to;
+	from.prev->next = to.next;
+	to.next->prev = from.prev;
+	to.next = from.next;
+	from.next = from.prev = &from;
+}
+#endif
 
 /*
 ===========
@@ -484,6 +508,17 @@ void idVertexCache::EndFrame() {
 	dynamicCountThisFrame = 0;
 	tempOverflow = false;
 
+#ifdef __WIIU__
+	// the back end may still be drawing the frame that was just finished on its
+	// own thread, so what that frame freed or used as temp headers is only
+	// released at the end of the next frame
+	while( olderDeferredFreeList.next != &olderDeferredFreeList ) {
+		ActuallyFree( olderDeferredFreeList.next );
+	}
+	MoveList( deferredFreeList, olderDeferredFreeList );
+	MoveList( olderDynamicHeaders, freeDynamicHeaders );
+	MoveList( dynamicHeaders, olderDynamicHeaders );
+#else
 	// free all the deferred free headers
 	while( deferredFreeList.next != &deferredFreeList ) {
 		ActuallyFree( deferredFreeList.next );
@@ -499,6 +534,7 @@ void idVertexCache::EndFrame() {
 
 		dynamicHeaders.next = dynamicHeaders.prev = &dynamicHeaders;
 	}
+#endif
 }
 
 /*

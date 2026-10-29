@@ -30,10 +30,15 @@ If you have questions concerning this license or the applicable additional terms
 // buffer and copies that to the TV and the GamePad at the end of each frame.
 
 #include <malloc.h>
+#include <exception>
 
 #include <coreinit/cache.h>
 #include <coreinit/memfrmheap.h>
 #include <coreinit/memheap.h>
+#include <coreinit/core.h>
+#include <coreinit/event.h>
+#include <coreinit/thread.h>
+#include <whb/proc.h>
 #include <gx2/clear.h>
 #include <gx2/display.h>
 #include <gx2/event.h>
@@ -52,6 +57,7 @@ extern idCVar com_speeds;
 #include "sys/wiiu/gx2_local.h"
 #include "sys/wiiu/wiiu_loadprofile.h"
 #include "sys/wiiu/wiiu_keyboard.h"
+#include "sys/wiiu/wiiu_renderthread.h"
 
 GX2ColorBuffer		gx2ColorBuffer;
 GX2DepthBuffer		gx2DepthBuffer;
@@ -76,6 +82,7 @@ static GX2ContextState *	drcContextState;
 static const GX2TVRenderMode TV_RENDER_MODE = GX2_TV_RENDER_MODE_WIDE_720P;
 static const GX2SurfaceFormat SCAN_FORMAT = GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8;
 
+idCVar r_wiiuRenderThread( "r_wiiuRenderThread", "1", CVAR_RENDERER | CVAR_BOOL, "let the game work on the next frame (on another CPU core) while the last one is drawn" );
 idCVar r_wiiuProfile( "r_wiiuProfile", "5", CVAR_RENDERER | CVAR_INTEGER, "log performance statistics every N seconds (0 = never)" );
 idCVar r_gx2Test( "r_gx2Test", "0", CVAR_RENDERER | CVAR_INTEGER, "debug: 1: draw a test pattern on top of every frame, 2: show the captured (packed) depth texture, 3: show a white texture instead, 7: open the software keyboard" );
 // NOTE: doesn't work in Cemu, which doesn't write GPU rendered surfaces back to emulated memory
@@ -124,6 +131,169 @@ static void *AllocSurface( GX2Surface &surface ) {
 	memset( surface.image, 0, surface.imageSize );
 	GX2Invalidate( GX2_INVALIDATE_MODE_CPU, surface.image, surface.imageSize );
 	return surface.image;
+}
+
+/*
+===============================================================================
+
+	Render thread
+
+The renderer's back end (sending the draws to the GPU) runs on its own thread on
+CPU1, the core GX2 was set up on. While it draws a frame, the engine thread
+runs the game and the renderer's front end for the next frame on CPU2. When the
+engine thread has to send anything to the GPU itself (loading textures, ...) or
+free what the back end may still use, it waits until the render thread is idle
+and moves back to CPU1 (WiiU_SyncRenderThread()), until it issues the next frame.
+
+ProcUI (the HOME menu) has to be handled on CPU1 too, so the render thread does
+that after every frame, the engine thread only checks WiiU_ProcIsRunning().
+
+===============================================================================
+*/
+
+#define GX2_CORE			1	// where GX2Init() was called, the engine thread starts there
+#define GAME_CORE			2
+#define RENDER_STACK_SIZE	( 1024 * 1024 )
+
+OSThread *				gx2RenderThread;
+static uint8_t *		renderThreadStack;
+static OSEvent			renderWork;			// auto reset: a new job
+static OSEvent			renderIdle;			// manual reset: set while there is no job
+static const void *		renderCmds;
+static volatile bool	renderQuit;
+static volatile bool	procRunning = true;
+static bool				mainThreadOwnsGX2 = true;	// the render thread is idle and the engine thread is on GX2_CORE
+
+// for the perf line
+static double			renderWaitMs;
+static int				renderSyncs;
+static const char *		lastSyncReason;
+
+static int RenderThreadMain( int argc, const char **argv ) {
+	while ( true ) {
+		OSWaitEvent( &renderWork );
+		if ( renderQuit ) {
+			break;
+		}
+		try {
+			RB_ExecuteBackEndCommands( (const emptyCommand_t *)renderCmds );
+		} catch ( std::exception & ) {
+			// common->Error() in the back end, nothing on this thread can handle it
+		} catch ( ... ) {
+		}
+		renderCmds = NULL;
+		if ( procRunning && !WHBProcIsRunning() ) {
+			procRunning = false;
+		}
+		OSSignalEvent( &renderIdle );
+	}
+	OSSignalEvent( &renderIdle );
+	return 0;
+}
+
+static void MoveToCore( int core ) {
+	OSThread *self = OSGetCurrentThread();
+	OSSetThreadAffinity( self, 1 << core );
+	for ( int i = 0; i < 10000 && OSGetCoreId() != (uint32_t)core; i++ ) {
+		OSYieldThread();
+	}
+	static bool warned;
+	if ( OSGetCoreId() != (uint32_t)core && !warned ) {
+		warned = true;
+		common->Printf( "WARNING: the engine thread couldn't move to CPU%d\n", core );
+	}
+}
+
+static void WaitRenderIdle( void ) {
+	double start = Sys_MillisecondsPrecise();
+	OSWaitEvent( &renderIdle );
+	renderWaitMs += Sys_MillisecondsPrecise() - start;
+}
+
+static void StartRenderThread( void ) {
+	OSInitEvent( &renderWork, FALSE, OS_EVENT_MODE_AUTO );
+	OSInitEvent( &renderIdle, TRUE, OS_EVENT_MODE_MANUAL );
+	renderQuit = false;
+	OSThread *thread = (OSThread *)memalign( 16, sizeof( OSThread ) );
+	renderThreadStack = (uint8_t *)memalign( 16, RENDER_STACK_SIZE );
+	OSThread *self = OSGetCurrentThread();
+	if ( !thread || !renderThreadStack || !OSCreateThread( thread, RenderThreadMain, 0, NULL, renderThreadStack + RENDER_STACK_SIZE,
+			RENDER_STACK_SIZE, OSGetThreadPriority( self ), OS_THREAD_ATTRIB_AFFINITY_CPU1 ) ) {
+		common->Warning( "Couldn't create the render thread, drawing on the engine thread" );
+		free( thread );
+		free( renderThreadStack );
+		return;
+	}
+	OSSetThreadName( thread, "dhewm3 render" );
+	gx2RenderThread = thread;
+	mainThreadOwnsGX2 = true;
+	OSResumeThread( thread );
+}
+
+static void StopRenderThread( void ) {
+	if ( !gx2RenderThread ) {
+		return;
+	}
+	WiiU_SyncRenderThread();
+	renderQuit = true;
+	OSSignalEvent( &renderWork );
+	int result;
+	OSJoinThread( gx2RenderThread, &result );
+	free( gx2RenderThread );
+	free( renderThreadStack );
+	gx2RenderThread = NULL;
+	renderThreadStack = NULL;
+}
+
+void WiiU_SyncRenderThreadFor( const char *reason ) {
+	if ( !gx2RenderThread || mainThreadOwnsGX2 || OSGetCurrentThread() == gx2RenderThread ) {
+		return;
+	}
+	WaitRenderIdle();
+	MoveToCore( GX2_CORE );
+	mainThreadOwnsGX2 = true;
+	renderSyncs++;
+	lastSyncReason = reason;
+}
+
+void WiiU_SyncRenderThread( void ) {
+	WiiU_SyncRenderThreadFor( "engine" );
+}
+
+void WiiU_ExecuteBackEnd( const void *cmds, bool async ) {
+	if ( !gx2RenderThread ) {
+		RB_ExecuteBackEndCommands( (const emptyCommand_t *)cmds );
+		return;
+	}
+	if ( OSGetCurrentThread() == gx2RenderThread ) {
+		// common->Error() during the back end can end up here
+		RB_ExecuteBackEndCommands( (const emptyCommand_t *)cmds );
+		return;
+	}
+	WaitRenderIdle();
+	OSResetEvent( &renderIdle );
+	renderCmds = cmds;
+	OSSignalEvent( &renderWork );
+
+	if ( !async || !r_wiiuRenderThread.GetBool() ) {
+		WaitRenderIdle();
+		if ( !mainThreadOwnsGX2 ) {
+			MoveToCore( GX2_CORE );
+			mainThreadOwnsGX2 = true;
+		}
+		return;
+	}
+	if ( mainThreadOwnsGX2 ) {
+		mainThreadOwnsGX2 = false;
+		MoveToCore( GAME_CORE );
+	}
+}
+
+bool WiiU_ProcIsRunning( void ) {
+	if ( !gx2RenderThread ) {
+		return WHBProcIsRunning();
+	}
+	return procRunning;
 }
 
 bool GLimp_Init( glimpParms_t parms ) {
@@ -207,6 +377,7 @@ bool GLimp_Init( glimpParms_t parms ) {
 	GX2GL_Init();
 
 	gx2Initialized = true;
+	StartRenderThread();
 	curParms = parms;
 	glConfig.isFullscreen = true;
 	glConfig.displayFrequency = 60;
@@ -220,6 +391,7 @@ void GLimp_Shutdown( void ) {
 	if ( !gx2Initialized ) {
 		return;
 	}
+	StopRenderThread();
 	GX2GL_Shutdown();
 	WiiU_KeyboardShutdown();
 	if ( drcContextState ) {
@@ -396,9 +568,14 @@ static void ProfileFrame( double gpuWaitMs, int draws ) {
 	double elapsed = now - prof.periodStart;
 	if ( elapsed >= interval * 1000.0 && prof.frames > 0 ) {
 		float n = prof.frames;
-		common->Printf( "Wii U perf: %.1f fps | frame avg %.1f ms, worst %.0f ms | game %.1f, render frontend %.1f, backend %.1f, GPU wait %.1f ms | %.0f draws | %d MB in use\n",
+		common->Printf( "Wii U perf: %.1f fps | frame avg %.1f ms, worst %.0f ms | game %.1f, render frontend %.1f, backend %.1f, GPU wait %.1f ms | %.0f draws | %d MB in use"
+			" | engine waited for render thread %.1f ms, %d syncs (last: %s)\n",
 			prof.frames * 1000.0 / elapsed, prof.frameMs / n, prof.worstFrameMs,
-			prof.gameMs / n, prof.frontendMs / n, prof.backendMs / n, prof.gpuWaitMs / n, prof.draws / n, Wiiu_MemoryUsedMB() );
+			prof.gameMs / n, prof.frontendMs / n, prof.backendMs / n, prof.gpuWaitMs / n, prof.draws / n, Wiiu_MemoryUsedMB(),
+			renderWaitMs / n, renderSyncs, lastSyncReason ? lastSyncReason : "-" );
+		renderWaitMs = 0.0;
+		renderSyncs = 0;
+		lastSyncReason = NULL;
 		double last = prof.lastSwap;
 		memset( &prof, 0, sizeof( prof ) );
 		prof.lastSwap = last;
@@ -498,6 +675,7 @@ void GLimp_GrabInput( int flags ) {
 }
 
 bool GLimp_SetSwapInterval( int swapInterval ) {
+	WiiU_SyncRenderThread();
 	GX2SetSwapInterval( swapInterval );
 	return true;
 }

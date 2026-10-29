@@ -38,6 +38,54 @@ If you have questions concerning this license or the applicable additional terms
 
 #include "renderer/tr_local.h"
 
+#ifdef __WIIU__
+#include "sys/wiiu/wiiu_renderthread.h"
+
+// set while R_EndFrame() issues the frame, which the back end then draws on
+// its own thread while the front end goes on with the next frame
+static bool			wiiuAsyncIssue;
+frameData_t *		wiiuBackEndFrameData;
+
+/*
+====================
+R_SnapshotDrawSurfGeometry
+
+Models that change every frame (animated meshes, particles...) update their
+srfTriangles_t in place - give every surface of the issued frame its own copy
+of it, so the back end still sees this frame's vertex cache pointers and counts
+while the front end works on the next frame.
+====================
+*/
+static void R_SnapshotDrawSurf( const drawSurf_t *surf ) {
+	if ( surf->geo ) {
+		srfTriangles_t *copy = (srfTriangles_t *)R_FrameAlloc( sizeof( *copy ) );
+		*copy = *surf->geo;
+		const_cast<drawSurf_t *>( surf )->geo = copy;
+	}
+}
+
+static void R_SnapshotDrawSurfGeometry( const emptyCommand_t *cmds ) {
+	for ( ; cmds; cmds = (const emptyCommand_t *)cmds->next ) {
+		if ( cmds->commandId != RC_DRAW_VIEW ) {
+			continue;
+		}
+		const viewDef_t *viewDef = ( (const drawSurfsCommand_t *)cmds )->viewDef;
+		for ( int i = 0; i < viewDef->numDrawSurfs; i++ ) {
+			R_SnapshotDrawSurf( viewDef->drawSurfs[i] );
+		}
+		for ( const viewLight_t *vLight = viewDef->viewLights; vLight; vLight = vLight->next ) {
+			const drawSurf_t *lists[] = { vLight->globalShadows, vLight->localInteractions, vLight->localShadows,
+				vLight->globalInteractions, vLight->translucentInteractions };
+			for ( int i = 0; i < (int)( sizeof( lists ) / sizeof( lists[0] ) ); i++ ) {
+				for ( const drawSurf_t *surf = lists[i]; surf; surf = surf->nextOnLight ) {
+					R_SnapshotDrawSurf( surf );
+				}
+			}
+		}
+	}
+}
+#endif
+
 idRenderSystemLocal	tr;
 idRenderSystem	*renderSystem = &tr;
 
@@ -150,7 +198,15 @@ static void R_IssueRenderCommands( void ) {
 	// r_skipRender is usually more usefull, because it will still
 	// draw 2D graphics
 	if ( !r_skipBackEnd.GetBool() ) {
+#ifdef __WIIU__
+		if ( wiiuAsyncIssue ) {
+			R_SnapshotDrawSurfGeometry( frameData->cmdHead );
+			wiiuBackEndFrameData = frameData;
+		}
+		WiiU_ExecuteBackEnd( frameData->cmdHead, wiiuAsyncIssue );
+#else
 		RB_ExecuteBackEndCommands( frameData->cmdHead );
+#endif
 	}
 
 	R_ClearCommandChain();
@@ -705,7 +761,13 @@ void idRenderSystemLocal::EndFrame( int *frontEndMsec, int *backEndMsec ) {
 	cmd->commandId = RC_SWAP_BUFFERS;
 
 	// start the back end up again with the new command list
+#ifdef __WIIU__
+	wiiuAsyncIssue = true;
 	R_IssueRenderCommands();
+	wiiuAsyncIssue = false;
+#else
+	R_IssueRenderCommands();
+#endif
 
 	// use the other buffers next frame, because another CPU
 	// may still be rendering into the current buffers

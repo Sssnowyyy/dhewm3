@@ -495,6 +495,9 @@ if(D3_COMPILER_IS_GCC_OR_CLANG)
 	if(WIIU)
 		# newlib has no fopen64() etc, its off_t is 64bit anyway
 		add_definitions(-DIOAPI_NO_64)
+		# the renderer's back end runs on its own thread (sys/wiiu/gx2_glimp.cpp),
+		# idHeap isn't thread-safe, newlib's malloc() is
+		add_definitions(-DUSE_LIBC_MALLOC=1)
 	elseif(AROS)
 		set(CMAKE_SHARED_LIBRARY_SUFFIX ".aros-${cpu}")
 		add_definitions(-DIOAPI_NO_64)

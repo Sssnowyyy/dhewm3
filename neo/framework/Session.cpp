@@ -36,6 +36,9 @@ If you have questions concerning this license or the applicable additional terms
 #include "renderer/ModelManager.h"
 
 #include "framework/Session_local.h"
+#ifdef __WIIU__
+#include "sys/wiiu/wiiu_renderthread.h"
+#endif
 
 #ifdef __WIIU__
 #include "sys/wiiu/wiiu_loadprofile.h"
@@ -1453,6 +1456,9 @@ Exits with mapSpawned = false
 ===============
 */
 void idSessionLocal::UnloadMap() {
+#ifdef __WIIU__
+	WiiU_SyncRenderThread();	// the back end may still be drawing the last frame
+#endif
 	StopPlayingRenderDemo();
 
 	// end the current map in the game

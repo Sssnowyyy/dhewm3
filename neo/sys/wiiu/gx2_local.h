@@ -33,6 +33,7 @@ If you have questions concerning this license or the applicable additional terms
 #define __GX2_LOCAL_H__
 
 #include <coreinit/time.h>
+#include <coreinit/thread.h>
 #include <gx2/context.h>
 #include <gx2/surface.h>
 
@@ -46,6 +47,9 @@ extern GX2DepthBuffer	gx2DepthBuffer;
 extern GX2ColorBuffer	gx2DepthColorBuffer;
 extern GX2ContextState*	gx2ContextState;
 extern bool				gx2Foreground;	// false while the HOME menu owns the GPU
+
+// the thread that runs the renderer's back end, NULL before it was started
+extern OSThread *		gx2RenderThread;
 
 // GL layer
 void	GX2GL_Init( void );

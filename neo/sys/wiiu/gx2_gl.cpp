@@ -47,6 +47,7 @@ Current limitations:
 */
 
 #include <malloc.h>
+#include <coreinit/mutex.h>
 
 #include <coreinit/cache.h>
 #include <gx2/clear.h>
@@ -65,6 +66,7 @@ Current limitations:
 #include "renderer/tr_local.h"
 
 #include "sys/wiiu/gx2_local.h"
+#include "sys/wiiu/wiiu_renderthread.h"
 
 #include "sys/wiiu/gx2_shaders.h"
 
@@ -123,9 +125,13 @@ void *GX2GL_FrameAlloc( size_t size, size_t align ) {
 	return frameArena + ofs;
 }
 
+static OSMutex deferredFreeMutex;	// the engine thread frees vertex cache buffers too
+
 static void DeferredFree( void *ptr ) {
 	if ( ptr ) {
+		OSLockMutex( &deferredFreeMutex );
 		deferredFrees[frameSlot].Append( ptr );
+		OSUnlockMutex( &deferredFreeMutex );
 	}
 }
 
@@ -247,7 +253,6 @@ static struct {
 	float			currentColor[4];
 
 	// buffers
-	GLuint			arrayBuffer, elementArrayBuffer;
 
 	// programs
 	GLuint			boundVertexProgram, boundFragmentProgram;
@@ -255,7 +260,35 @@ static struct {
 } gl;
 
 static idList<glTexture_t *>	textures;	// index is the GL name
-static idList<glBuffer_t *>		buffers;
+/*
+Buffer objects: the engine thread fills vertex cache buffers (the renderer's front
+end) while the render thread draws from others (the back end), so these work from
+both threads: they're kept in pages that never move, and each thread has its own
+buffer bindings. Everything else must only be used by one thread at a time, see
+CHECK_THREAD().
+*/
+#define BUFFER_PAGE_SIZE	1024
+#define MAX_BUFFER_PAGES	256
+static glBuffer_t **		bufferPages[MAX_BUFFER_PAGES];
+static volatile GLuint		numBufferNames = 1;		// 0 is no buffer
+static OSMutex				bufferMutex;
+
+struct bufferBindings_t {
+	GLuint		arrayBuffer, elementArrayBuffer;
+};
+static bufferBindings_t		renderThreadBindings, otherBindings;
+
+static bufferBindings_t &Bindings( void ) {
+	return OSGetCurrentThread() == gx2RenderThread ? renderThreadBindings : otherBindings;
+}
+
+// GL functions that send anything to the GPU (or change state the back end
+// uses) wait until the render thread is idle and move to its core when they're
+// called from another thread, see gx2_glimp.cpp
+#define CHECK_THREAD() \
+	if ( gx2RenderThread && OSGetCurrentThread() != gx2RenderThread ) { \
+		WiiU_SyncRenderThreadFor( __func__ ); \
+	}
 static glProgram_t				programs[2][MAX_PROGRAM_IDENTS];	// vertex, fragment
 
 // immediate mode
@@ -367,10 +400,10 @@ static glTexture_t *BoundTexture( int unit, GLenum target ) {
 }
 
 static glBuffer_t *Buffer( GLuint name ) {
-	if ( name == 0 || (int)name >= buffers.Num() ) {
+	if ( name == 0 || name >= numBufferNames ) {
 		return NULL;
 	}
-	return buffers[name];
+	return bufferPages[name / BUFFER_PAGE_SIZE][name % BUFFER_PAGE_SIZE];
 }
 
 // resolves a gl*Pointer() pointer, which is an offset if a VBO was bound
@@ -626,8 +659,11 @@ void GX2GL_Init( void ) {
 	// name 0 is never valid
 	textures.Clear();
 	textures.Append( NULL );
-	buffers.Clear();
-	buffers.Append( NULL );
+	OSInitMutex( &bufferMutex );
+	OSInitMutex( &deferredFreeMutex );
+	numBufferNames = 1;
+	memset( &renderThreadBindings, 0, sizeof( renderThreadBindings ) );
+	memset( &otherBindings, 0, sizeof( otherBindings ) );
 	memset( programs, 0, sizeof( programs ) );
 
 	GX2GL_RestoreState();
@@ -656,13 +692,20 @@ void GX2GL_Shutdown( void ) {
 		}
 	}
 	textures.Clear();
-	for ( int i = 0; i < buffers.Num(); i++ ) {
-		if ( buffers[i] ) {
-			free( buffers[i]->data );
-			delete buffers[i];
+	for ( int p = 0; p < MAX_BUFFER_PAGES; p++ ) {
+		if ( !bufferPages[p] ) {
+			continue;
 		}
+		for ( int i = 0; i < BUFFER_PAGE_SIZE; i++ ) {
+			if ( bufferPages[p][i] ) {
+				free( bufferPages[p][i]->data );
+				delete bufferPages[p][i];
+			}
+		}
+		free( bufferPages[p] );
+		bufferPages[p] = NULL;
 	}
-	buffers.Clear();
+	numBufferNames = 1;
 	for ( int i = 0; i < NUM_FRAME_SLOTS; i++ ) {
 		free( frameArenas[i] );
 		frameArenas[i] = NULL;
@@ -736,10 +779,12 @@ void GX2GL_EndFrame( OSTime submitted ) {
 	} else {
 		GX2DrawDone();
 	}
+	OSLockMutex( &deferredFreeMutex );
 	for ( int i = 0; i < deferredFrees[frameSlot].Num(); i++ ) {
 		free( deferredFrees[frameSlot][i] );
 	}
 	deferredFrees[frameSlot].Clear();
+	OSUnlockMutex( &deferredFreeMutex );
 	frameArena = frameArenas[frameSlot];
 	frameArenaUsed = 0;
 	InvalidateAttributeCache();
@@ -1267,6 +1312,7 @@ static void DrawArraysInternal( GLenum mode, GLenum indexType, const void *indic
 extern "C" {
 
 const GLubyte * APIENTRY glGetString( GLenum name ) {
+	CHECK_THREAD();
 	switch ( name ) {
 		case GL_VENDOR:		return (const GLubyte *)"dhewm3";
 		case GL_RENDERER:	return (const GLubyte *)"Wii U GX2";
@@ -1288,6 +1334,7 @@ GLenum APIENTRY glGetError( void ) {
 }
 
 void APIENTRY glGetIntegerv( GLenum pname, GLint *params ) {
+	CHECK_THREAD();
 	switch ( pname ) {
 		case GL_MAX_TEXTURE_SIZE:				*params = 4096; break;
 		case GL_MAX_TEXTURE_UNITS_ARB:			*params = MAX_UNITS; break;
@@ -1302,6 +1349,7 @@ void APIENTRY glGetIntegerv( GLenum pname, GLint *params ) {
 }
 
 void APIENTRY glGetFloatv( GLenum pname, GLfloat *params ) {
+	CHECK_THREAD();
 	switch ( pname ) {
 		case GL_MODELVIEW_MATRIX:	memcpy( params, gl.modelview.m[gl.modelview.depth], 16 * sizeof( float ) ); break;
 		case GL_PROJECTION_MATRIX:	memcpy( params, gl.projection.m[gl.projection.depth], 16 * sizeof( float ) ); break;
@@ -1333,6 +1381,7 @@ static bool *Capability( GLenum cap ) {
 }
 
 void APIENTRY glEnable( GLenum cap ) {
+	CHECK_THREAD();
 	bool *b = Capability( cap );
 	if ( b ) {
 		*b = true;
@@ -1340,6 +1389,7 @@ void APIENTRY glEnable( GLenum cap ) {
 }
 
 void APIENTRY glDisable( GLenum cap ) {
+	CHECK_THREAD();
 	bool *b = Capability( cap );
 	if ( b ) {
 		*b = false;
@@ -1347,6 +1397,7 @@ void APIENTRY glDisable( GLenum cap ) {
 }
 
 GLboolean APIENTRY glIsEnabled( GLenum cap ) {
+	CHECK_THREAD();
 	bool *b = Capability( cap );
 	return b && *b;
 }
@@ -1362,6 +1413,7 @@ static glArray_t *ClientArray( GLenum array ) {
 }
 
 void APIENTRY glEnableClientState( GLenum array ) {
+	CHECK_THREAD();
 	glArray_t *a = ClientArray( array );
 	if ( a ) {
 		a->enabled = true;
@@ -1369,6 +1421,7 @@ void APIENTRY glEnableClientState( GLenum array ) {
 }
 
 void APIENTRY glDisableClientState( GLenum array ) {
+	CHECK_THREAD();
 	glArray_t *a = ClientArray( array );
 	if ( a ) {
 		a->enabled = false;
@@ -1380,61 +1433,73 @@ static void SetArray( glArray_t &a, GLint size, GLenum type, GLsizei stride, con
 	a.type = type;
 	a.stride = stride;
 	a.ptr = ptr;
-	a.buffer = gl.arrayBuffer;
+	a.buffer = Bindings().arrayBuffer;
 }
 
 void APIENTRY glVertexPointer( GLint size, GLenum type, GLsizei stride, const GLvoid *ptr ) {
+	CHECK_THREAD();
 	SetArray( gl.vertexArray, size, type, stride, ptr );
 }
 
 void APIENTRY glColorPointer( GLint size, GLenum type, GLsizei stride, const GLvoid *ptr ) {
+	CHECK_THREAD();
 	SetArray( gl.colorArray, size, type, stride, ptr );
 }
 
 void APIENTRY glNormalPointer( GLenum type, GLsizei stride, const GLvoid *ptr ) {
+	CHECK_THREAD();
 	SetArray( gl.normalArray, 3, type, stride, ptr );
 }
 
 void APIENTRY glTexCoordPointer( GLint size, GLenum type, GLsizei stride, const GLvoid *ptr ) {
+	CHECK_THREAD();
 	SetArray( gl.units[gl.clientActiveUnit].texCoordArray, size, type, stride, ptr );
 }
 
 void APIENTRY glDrawElements( GLenum mode, GLsizei count, GLenum type, const GLvoid *indices ) {
+	CHECK_THREAD();
 	const void *idx = indices;
-	if ( gl.elementArrayBuffer ) {
-		glBuffer_t *b = Buffer( gl.elementArrayBuffer );
+	GLuint elementArrayBuffer = Bindings().elementArrayBuffer;
+	if ( elementArrayBuffer ) {
+		glBuffer_t *b = Buffer( elementArrayBuffer );
 		if ( !b ) {
 			return;
 		}
 		idx = b->data + (uintptr_t)indices;
 	}
-	DrawArraysInternal( mode, type, idx, gl.elementArrayBuffer != 0, count, 0 );
+	DrawArraysInternal( mode, type, idx, elementArrayBuffer != 0, count, 0 );
 }
 
 void APIENTRY glDrawArrays( GLenum mode, GLint first, GLsizei count ) {
+	CHECK_THREAD();
 	DrawArraysInternal( mode, GL_UNSIGNED_INT, NULL, false, count, first );
 }
 
 // matrices
 
 void APIENTRY glMatrixMode( GLenum mode ) {
+	CHECK_THREAD();
 	gl.matrixMode = mode;
 }
 
 void APIENTRY glLoadIdentity( void ) {
+	CHECK_THREAD();
 	MatrixIdentity( CurrentMatrix() );
 }
 
 void APIENTRY glLoadMatrixf( const GLfloat *m ) {
+	CHECK_THREAD();
 	memcpy( CurrentMatrix(), m, 16 * sizeof( float ) );
 }
 
 void APIENTRY glMultMatrixf( const GLfloat *m ) {
+	CHECK_THREAD();
 	float *cur = CurrentMatrix();
 	MatrixMultiply( cur, m, cur );
 }
 
 void APIENTRY glPushMatrix( void ) {
+	CHECK_THREAD();
 	glMatrixStack_t *s = CurrentMatrixStack();
 	if ( s->depth < 31 ) {
 		memcpy( s->m[s->depth + 1], s->m[s->depth], 16 * sizeof( float ) );
@@ -1443,6 +1508,7 @@ void APIENTRY glPushMatrix( void ) {
 }
 
 void APIENTRY glPopMatrix( void ) {
+	CHECK_THREAD();
 	glMatrixStack_t *s = CurrentMatrixStack();
 	if ( s->depth > 0 ) {
 		s->depth--;
@@ -1450,6 +1516,7 @@ void APIENTRY glPopMatrix( void ) {
 }
 
 void APIENTRY glOrtho( GLdouble left, GLdouble right, GLdouble bottom, GLdouble top, GLdouble zNear, GLdouble zFar ) {
+	CHECK_THREAD();
 	float m[16];
 	MatrixIdentity( m );
 	m[0] = 2.0f / ( right - left );
@@ -1464,28 +1531,34 @@ void APIENTRY glOrtho( GLdouble left, GLdouble right, GLdouble bottom, GLdouble 
 // state
 
 void APIENTRY glBlendFunc( GLenum sfactor, GLenum dfactor ) {
+	CHECK_THREAD();
 	gl.blendSrc = sfactor;
 	gl.blendDst = dfactor;
 }
 
 void APIENTRY glBlendEquation( GLenum mode ) {
+	CHECK_THREAD();
 	gl.blendEquation = mode;
 }
 
 void APIENTRY glDepthFunc( GLenum func ) {
+	CHECK_THREAD();
 	gl.depthFunc = func;
 }
 
 void APIENTRY glDepthMask( GLboolean flag ) {
+	CHECK_THREAD();
 	gl.depthMask = flag;
 }
 
 void APIENTRY glDepthRange( GLclampd zNear, GLclampd zFar ) {
+	CHECK_THREAD();
 	gl.depthNear = zNear;
 	gl.depthFar = zFar;
 }
 
 void APIENTRY glColorMask( GLboolean r, GLboolean g, GLboolean b, GLboolean a ) {
+	CHECK_THREAD();
 	gl.colorMask[0] = r;
 	gl.colorMask[1] = g;
 	gl.colorMask[2] = b;
@@ -1493,16 +1566,19 @@ void APIENTRY glColorMask( GLboolean r, GLboolean g, GLboolean b, GLboolean a ) 
 }
 
 void APIENTRY glStencilFunc( GLenum func, GLint ref, GLuint mask ) {
+	CHECK_THREAD();
 	gl.stencilFunc = func;
 	gl.stencilRef = ref;
 	gl.stencilFuncMask = mask;
 }
 
 void APIENTRY glStencilMask( GLuint mask ) {
+	CHECK_THREAD();
 	gl.stencilWriteMask = mask;
 }
 
 void APIENTRY glStencilOp( GLenum fail, GLenum zfail, GLenum zpass ) {
+	CHECK_THREAD();
 	for ( int i = 0; i < 2; i++ ) {
 		gl.stencilFail[i] = fail;
 		gl.stencilZFail[i] = zfail;
@@ -1511,6 +1587,7 @@ void APIENTRY glStencilOp( GLenum fail, GLenum zfail, GLenum zpass ) {
 }
 
 void APIENTRY glStencilOpSeparate( GLenum face, GLenum fail, GLenum zfail, GLenum zpass ) {
+	CHECK_THREAD();
 	for ( int i = 0; i < 2; i++ ) {
 		if ( ( i == 0 && face == GL_BACK ) || ( i == 1 && face == GL_FRONT ) ) {
 			continue;
@@ -1522,24 +1599,29 @@ void APIENTRY glStencilOpSeparate( GLenum face, GLenum fail, GLenum zfail, GLenu
 }
 
 void APIENTRY glAlphaFunc( GLenum func, GLclampf ref ) {
+	CHECK_THREAD();
 	gl.alphaFunc = func;
 	gl.alphaRef = ref;
 }
 
 void APIENTRY glCullFace( GLenum mode ) {
+	CHECK_THREAD();
 	gl.cullMode = mode;
 }
 
 void APIENTRY glFrontFace( GLenum mode ) {
+	CHECK_THREAD();
 	gl.frontFace = mode;
 }
 
 void APIENTRY glPolygonOffset( GLfloat factor, GLfloat units ) {
+	CHECK_THREAD();
 	gl.polyOffsetFactor = factor;
 	gl.polyOffsetUnits = units;
 }
 
 void APIENTRY glViewport( GLint x, GLint y, GLsizei width, GLsizei height ) {
+	CHECK_THREAD();
 	gl.viewport[0] = x;
 	gl.viewport[1] = y;
 	gl.viewport[2] = width;
@@ -1547,6 +1629,7 @@ void APIENTRY glViewport( GLint x, GLint y, GLsizei width, GLsizei height ) {
 }
 
 void APIENTRY glScissor( GLint x, GLint y, GLsizei width, GLsizei height ) {
+	CHECK_THREAD();
 	gl.scissor[0] = x;
 	gl.scissor[1] = y;
 	gl.scissor[2] = width;
@@ -1554,6 +1637,7 @@ void APIENTRY glScissor( GLint x, GLint y, GLsizei width, GLsizei height ) {
 }
 
 void APIENTRY glClearColor( GLclampf r, GLclampf g, GLclampf b, GLclampf a ) {
+	CHECK_THREAD();
 	gl.clearColor[0] = r;
 	gl.clearColor[1] = g;
 	gl.clearColor[2] = b;
@@ -1561,14 +1645,17 @@ void APIENTRY glClearColor( GLclampf r, GLclampf g, GLclampf b, GLclampf a ) {
 }
 
 void APIENTRY glClearDepth( GLclampd depth ) {
+	CHECK_THREAD();
 	gl.clearDepth = depth;
 }
 
 void APIENTRY glClearStencil( GLint s ) {
+	CHECK_THREAD();
 	gl.clearStencil = s;
 }
 
 void APIENTRY glClear( GLbitfield mask ) {
+	CHECK_THREAD();
 	if ( !gx2Foreground ) {
 		return;
 	}
@@ -1588,16 +1675,19 @@ void APIENTRY glClear( GLbitfield mask ) {
 }
 
 void APIENTRY glFinish( void ) {
+	CHECK_THREAD();
 	GX2DrawDone();
 }
 
 void APIENTRY glFlush( void ) {
+	CHECK_THREAD();
 	GX2Flush();
 }
 
 // immediate mode
 
 void APIENTRY glBegin( GLenum mode ) {
+	CHECK_THREAD();
 	immMode = mode;
 	immVerts.SetNum( 0, false );
 }
@@ -1612,11 +1702,15 @@ static void ImmVertex( float x, float y, float z ) {
 	memcpy( v.st, gl.units[0].currentTexCoord, sizeof( v.st ) );
 }
 
-void APIENTRY glVertex2f( GLfloat x, GLfloat y ) { ImmVertex( x, y, 0.0f ); }
-void APIENTRY glVertex3f( GLfloat x, GLfloat y, GLfloat z ) { ImmVertex( x, y, z ); }
-void APIENTRY glVertex3fv( const GLfloat *v ) { ImmVertex( v[0], v[1], v[2] ); }
+void APIENTRY glVertex2f( GLfloat x, GLfloat y ) {
+	CHECK_THREAD(); ImmVertex( x, y, 0.0f ); }
+void APIENTRY glVertex3f( GLfloat x, GLfloat y, GLfloat z ) {
+	CHECK_THREAD(); ImmVertex( x, y, z ); }
+void APIENTRY glVertex3fv( const GLfloat *v ) {
+	CHECK_THREAD(); ImmVertex( v[0], v[1], v[2] ); }
 
 void APIENTRY glEnd( void ) {
+	CHECK_THREAD();
 	int n = immVerts.Num();
 	if ( n == 0 ) {
 		return;
@@ -1644,24 +1738,32 @@ void APIENTRY glEnd( void ) {
 }
 
 void APIENTRY glColor3f( GLfloat r, GLfloat g, GLfloat b ) {
+	CHECK_THREAD();
 	gl.currentColor[0] = r; gl.currentColor[1] = g; gl.currentColor[2] = b; gl.currentColor[3] = 1.0f;
 }
-void APIENTRY glColor3fv( const GLfloat *v ) { glColor3f( v[0], v[1], v[2] ); }
+void APIENTRY glColor3fv( const GLfloat *v ) {
+	CHECK_THREAD(); glColor3f( v[0], v[1], v[2] ); }
 void APIENTRY glColor4f( GLfloat r, GLfloat g, GLfloat b, GLfloat a ) {
+	CHECK_THREAD();
 	gl.currentColor[0] = r; gl.currentColor[1] = g; gl.currentColor[2] = b; gl.currentColor[3] = a;
 }
-void APIENTRY glColor4fv( const GLfloat *v ) { glColor4f( v[0], v[1], v[2], v[3] ); }
-void APIENTRY glColor4ubv( const GLubyte *v ) { glColor4f( v[0] / 255.0f, v[1] / 255.0f, v[2] / 255.0f, v[3] / 255.0f ); }
+void APIENTRY glColor4fv( const GLfloat *v ) {
+	CHECK_THREAD(); glColor4f( v[0], v[1], v[2], v[3] ); }
+void APIENTRY glColor4ubv( const GLubyte *v ) {
+	CHECK_THREAD(); glColor4f( v[0] / 255.0f, v[1] / 255.0f, v[2] / 255.0f, v[3] / 255.0f ); }
 
 void APIENTRY glTexCoord2f( GLfloat s, GLfloat t ) {
+	CHECK_THREAD();
 	float *tc = gl.units[0].currentTexCoord;
 	tc[0] = s; tc[1] = t; tc[2] = 0.0f; tc[3] = 1.0f;
 }
-void APIENTRY glTexCoord2fv( const GLfloat *v ) { glTexCoord2f( v[0], v[1] ); }
+void APIENTRY glTexCoord2fv( const GLfloat *v ) {
+	CHECK_THREAD(); glTexCoord2f( v[0], v[1] ); }
 
 // textures
 
 void APIENTRY glGenTextures( GLsizei n, GLuint *names ) {
+	CHECK_THREAD();
 	for ( int i = 0; i < n; i++ ) {
 		glTexture_t *t = new glTexture_t;
 		memset( t, 0, sizeof( *t ) );
@@ -1675,6 +1777,7 @@ void APIENTRY glGenTextures( GLsizei n, GLuint *names ) {
 }
 
 void APIENTRY glDeleteTextures( GLsizei n, const GLuint *names ) {
+	CHECK_THREAD();
 	for ( int i = 0; i < n; i++ ) {
 		if ( names[i] > 0 && (int)names[i] < textures.Num() && textures[names[i]] ) {
 			DeferredFree( textures[names[i]]->tex.surface.image );
@@ -1685,6 +1788,7 @@ void APIENTRY glDeleteTextures( GLsizei n, const GLuint *names ) {
 }
 
 void APIENTRY glBindTexture( GLenum target, GLuint texture ) {
+	CHECK_THREAD();
 	glTexUnit_t &u = gl.units[gl.activeUnit];
 	if ( target == GL_TEXTURE_CUBE_MAP_EXT ) {
 		u.boundCube = texture;
@@ -1712,10 +1816,13 @@ static void TexParameter( GLenum target, GLenum pname, float param ) {
 	t->samplerDirty = true;
 }
 
-void APIENTRY glTexParameteri( GLenum target, GLenum pname, GLint param ) { TexParameter( target, pname, (float)param ); }
-void APIENTRY glTexParameterf( GLenum target, GLenum pname, GLfloat param ) { TexParameter( target, pname, param ); }
+void APIENTRY glTexParameteri( GLenum target, GLenum pname, GLint param ) {
+	CHECK_THREAD(); TexParameter( target, pname, (float)param ); }
+void APIENTRY glTexParameterf( GLenum target, GLenum pname, GLfloat param ) {
+	CHECK_THREAD(); TexParameter( target, pname, param ); }
 
 void APIENTRY glTexEnvi( GLenum target, GLenum pname, GLint param ) {
+	CHECK_THREAD();
 	glTexUnit_t &u = gl.units[gl.activeUnit];
 	switch ( pname ) {
 		case GL_TEXTURE_ENV_MODE:	u.envMode = param; break;
@@ -1726,18 +1833,21 @@ void APIENTRY glTexEnvi( GLenum target, GLenum pname, GLint param ) {
 }
 
 void APIENTRY glTexEnvfv( GLenum target, GLenum pname, const GLfloat *params ) {
+	CHECK_THREAD();
 	if ( pname == GL_TEXTURE_ENV_COLOR ) {
 		memcpy( gl.units[gl.activeUnit].envColor, params, 4 * sizeof( float ) );
 	}
 }
 
 void APIENTRY glTexGenf( GLenum coord, GLenum pname, GLfloat param ) {
+	CHECK_THREAD();
 	if ( pname == GL_TEXTURE_GEN_MODE && coord >= GL_S && coord <= GL_Q ) {
 		gl.units[gl.activeUnit].texGenMode[coord - GL_S] = (GLenum)param;
 	}
 }
 
 void APIENTRY glTexGenfv( GLenum coord, GLenum pname, const GLfloat *params ) {
+	CHECK_THREAD();
 	if ( ( pname == GL_OBJECT_PLANE || pname == GL_EYE_PLANE ) && coord >= GL_S && coord <= GL_Q ) {
 		// TODO: GL_EYE_PLANE should be transformed by the inverse modelview matrix
 		memcpy( gl.units[gl.activeUnit].texGenPlane[coord - GL_S], params, 4 * sizeof( float ) );
@@ -1929,6 +2039,7 @@ static GLuint CreateWhiteTexture( GLenum target ) {
 
 void APIENTRY glTexImage2D( GLenum target, GLint level, GLint internalFormat, GLsizei width, GLsizei height,
 							GLint border, GLenum format, GLenum type, const GLvoid *pixels ) {
+	CHECK_THREAD();
 	int face = CubeFace( target );
 	glTexture_t *t = BoundTexture( gl.activeUnit, face >= 0 ? GL_TEXTURE_CUBE_MAP_EXT : GL_TEXTURE_2D );
 	if ( !t || width <= 0 || height <= 0 || ( type != GL_UNSIGNED_BYTE && !IsDepthFormat( internalFormat ) ) ) {
@@ -1960,6 +2071,7 @@ void APIENTRY glTexImage2D( GLenum target, GLint level, GLint internalFormat, GL
 
 void APIENTRY glTexSubImage2D( GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height,
 							   GLenum format, GLenum type, const GLvoid *pixels ) {
+	CHECK_THREAD();
 	int face = CubeFace( target );
 	glTexture_t *t = BoundTexture( gl.activeUnit, face >= 0 ? GL_TEXTURE_CUBE_MAP_EXT : GL_TEXTURE_2D );
 	if ( !t || !t->allocated || type != GL_UNSIGNED_BYTE ) {
@@ -1993,6 +2105,7 @@ static void CopyFramebuffer( glTexture_t *t, int xoffset, int yoffset, int x, in
 }
 
 void APIENTRY glCopyTexImage2D( GLenum target, GLint level, GLenum internalFormat, GLint x, GLint y, GLsizei width, GLsizei height, GLint border ) {
+	CHECK_THREAD();
 	glTexture_t *t = BoundTexture( gl.activeUnit, GL_TEXTURE_2D );
 	if ( !t || level != 0 ) {
 		return;
@@ -2002,6 +2115,7 @@ void APIENTRY glCopyTexImage2D( GLenum target, GLint level, GLenum internalForma
 }
 
 void APIENTRY glCopyTexSubImage2D( GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint x, GLint y, GLsizei width, GLsizei height ) {
+	CHECK_THREAD();
 	glTexture_t *t = BoundTexture( gl.activeUnit, GL_TEXTURE_2D );
 	if ( !t || !t->allocated || level != 0 ) {
 		return;
@@ -2010,6 +2124,7 @@ void APIENTRY glCopyTexSubImage2D( GLenum target, GLint level, GLint xoffset, GL
 }
 
 void APIENTRY glReadPixels( GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, GLvoid *pixels ) {
+	CHECK_THREAD();
 	// TODO: screenshots
 	if ( pixels && type == GL_UNSIGNED_BYTE ) {
 		memset( pixels, 0, width * height * ( format == GL_RGBA ? 4 : 3 ) );
@@ -2031,6 +2146,7 @@ void APIENTRY glReadPixels( GLint x, GLint y, GLsizei width, GLsizei height, GLe
 // GX2 copies that into the tiled texture
 static void APIENTRY gx2_glCompressedTexImage2DARB( GLenum target, GLint level, GLenum internalFormat, GLsizei width, GLsizei height,
 													GLint border, GLsizei imageSize, const GLvoid *data ) {
+	CHECK_THREAD();
 	glTexture_t *t = BoundTexture( gl.activeUnit, GL_TEXTURE_2D );
 	if ( !t || !data || width <= 0 || height <= 0 || !IsS3TCFormat( internalFormat ) || target != GL_TEXTURE_2D ) {
 		return;
@@ -2084,45 +2200,64 @@ static void APIENTRY gx2_glCompressedTexImage2DARB( GLenum target, GLint level, 
 }
 
 static void APIENTRY gx2_glGetCompressedTexImageARB( GLenum target, GLint level, GLvoid *img ) {
+	CHECK_THREAD();
 	// only used to write .dds files, which isn't supported
 }
 
 static void APIENTRY gx2_glActiveTextureARB( GLenum texture ) {
+	CHECK_THREAD();
 	gl.activeUnit = Min( (int)( texture - GL_TEXTURE0_ARB ), MAX_UNITS - 1 );
 }
 
 static void APIENTRY gx2_glClientActiveTextureARB( GLenum texture ) {
+	CHECK_THREAD();
 	gl.clientActiveUnit = Min( (int)( texture - GL_TEXTURE0_ARB ), MAX_UNITS - 1 );
 }
 
 static void APIENTRY gx2_glMultiTexCoord2fARB( GLenum target, GLfloat s, GLfloat t ) {
+	CHECK_THREAD();
 	float *tc = gl.units[Min( (int)( target - GL_TEXTURE0_ARB ), MAX_UNITS - 1 )].currentTexCoord;
 	tc[0] = s; tc[1] = t; tc[2] = 0.0f; tc[3] = 1.0f;
 }
 
 static void APIENTRY gx2_glMultiTexCoord2fvARB( GLenum target, GLfloat *v ) {
+	CHECK_THREAD();
 	gx2_glMultiTexCoord2fARB( target, v[0], v[1] );
 }
 
 // ARB_vertex_buffer_object
 
 static void APIENTRY gx2_glGenBuffersARB( GLsizei n, GLuint *names ) {
+	OSLockMutex( &bufferMutex );
 	for ( int i = 0; i < n; i++ ) {
+		GLuint name = numBufferNames;
+		int page = name / BUFFER_PAGE_SIZE;
+		if ( page >= MAX_BUFFER_PAGES ) {
+			common->FatalError( "GX2GL: out of buffer objects" );
+		}
+		if ( !bufferPages[page] ) {
+			bufferPages[page] = (glBuffer_t **)calloc( BUFFER_PAGE_SIZE, sizeof( glBuffer_t * ) );
+		}
 		glBuffer_t *b = new glBuffer_t;
 		b->data = NULL;
 		b->size = 0;
-		names[i] = buffers.Append( b );
+		bufferPages[page][name % BUFFER_PAGE_SIZE] = b;
+		numBufferNames = name + 1;	// only now other threads may look it up
+		names[i] = name;
 	}
+	OSUnlockMutex( &bufferMutex );
 }
 
 static void APIENTRY gx2_glDeleteBuffersARB( GLsizei n, const GLuint *names ) {
 	for ( int i = 0; i < n; i++ ) {
+		OSLockMutex( &bufferMutex );
 		glBuffer_t *b = Buffer( names[i] );
 		if ( b ) {
 			DeferredFree( b->data );
 			delete b;
-			buffers[names[i]] = NULL;
+			bufferPages[names[i] / BUFFER_PAGE_SIZE][names[i] % BUFFER_PAGE_SIZE] = NULL;
 		}
+		OSUnlockMutex( &bufferMutex );
 	}
 }
 
@@ -2132,14 +2267,15 @@ static GLboolean APIENTRY gx2_glIsBufferARB( GLuint name ) {
 
 static void APIENTRY gx2_glBindBufferARB( GLenum target, GLuint name ) {
 	if ( target == GL_ELEMENT_ARRAY_BUFFER_ARB ) {
-		gl.elementArrayBuffer = name;
+		Bindings().elementArrayBuffer = name;
 	} else {
-		gl.arrayBuffer = name;
+		Bindings().arrayBuffer = name;
 	}
 }
 
 static glBuffer_t *BoundBuffer( GLenum target ) {
-	return Buffer( target == GL_ELEMENT_ARRAY_BUFFER_ARB ? gl.elementArrayBuffer : gl.arrayBuffer );
+	bufferBindings_t &b = Bindings();
+	return Buffer( target == GL_ELEMENT_ARRAY_BUFFER_ARB ? b.elementArrayBuffer : b.arrayBuffer );
 }
 
 static void APIENTRY gx2_glBufferDataARB( GLenum target, GLsizeiptrARB size, const GLvoid *data, GLenum usage ) {
@@ -2183,6 +2319,7 @@ static GLboolean APIENTRY gx2_glUnmapBufferARB( GLenum target ) {
 // ARB_vertex_program / ARB_fragment_program
 
 static void APIENTRY gx2_glGenProgramsARB( GLsizei n, GLuint *names ) {
+	CHECK_THREAD();
 	// the renderer binds its programs by fixed idents, this isn't used
 	static GLuint next = MAX_PROGRAM_IDENTS / 2;
 	for ( int i = 0; i < n; i++ ) {
@@ -2191,6 +2328,7 @@ static void APIENTRY gx2_glGenProgramsARB( GLsizei n, GLuint *names ) {
 }
 
 static void APIENTRY gx2_glBindProgramARB( GLenum target, GLuint name ) {
+	CHECK_THREAD();
 	if ( target == GL_VERTEX_PROGRAM_ARB ) {
 		gl.boundVertexProgram = name;
 	} else {
@@ -2199,10 +2337,12 @@ static void APIENTRY gx2_glBindProgramARB( GLenum target, GLuint name ) {
 }
 
 static void APIENTRY gx2_glProgramStringARB( GLenum target, GLenum format, GLsizei len, const GLvoid *string ) {
+	CHECK_THREAD();
 	// can't compile ARB programs, see GX2GL_NameProgram()
 }
 
 void GX2GL_NameProgram( GLenum target, GLuint ident, const char *name ) {
+	CHECK_THREAD();
 	glProgram_t *p = Program( target == GL_VERTEX_PROGRAM_ARB ? 0 : 1, ident );
 	if ( !p ) {
 		return;
@@ -2217,12 +2357,14 @@ void GX2GL_NameProgram( GLenum target, GLuint ident, const char *name ) {
 }
 
 static void APIENTRY gx2_glProgramEnvParameter4fvARB( GLenum target, GLuint index, const GLfloat *params ) {
+	CHECK_THREAD();
 	if ( index < 256 ) {
 		memcpy( gl.programEnv[target == GL_VERTEX_PROGRAM_ARB ? 0 : 1][index], params, 4 * sizeof( float ) );
 	}
 }
 
 static void APIENTRY gx2_glProgramLocalParameter4fvARB( GLenum target, GLuint index, const GLfloat *params ) {
+	CHECK_THREAD();
 	bool vertex = target == GL_VERTEX_PROGRAM_ARB;
 	glProgram_t *p = Program( vertex ? 0 : 1, vertex ? gl.boundVertexProgram : gl.boundFragmentProgram );
 	if ( p && index < MAX_LOCAL_PARMS ) {
@@ -2231,18 +2373,21 @@ static void APIENTRY gx2_glProgramLocalParameter4fvARB( GLenum target, GLuint in
 }
 
 static void APIENTRY gx2_glVertexAttribPointerARB( GLuint index, GLint size, GLenum type, GLboolean normalized, GLsizei stride, const GLvoid *ptr ) {
+	CHECK_THREAD();
 	if ( index < MAX_VERTEX_ATTRIBS ) {
 		SetArray( gl.vertexAttribs[index], size, type, stride, ptr );
 	}
 }
 
 static void APIENTRY gx2_glEnableVertexAttribArrayARB( GLuint index ) {
+	CHECK_THREAD();
 	if ( index < MAX_VERTEX_ATTRIBS ) {
 		gl.vertexAttribs[index].enabled = true;
 	}
 }
 
 static void APIENTRY gx2_glDisableVertexAttribArrayARB( GLuint index ) {
+	CHECK_THREAD();
 	if ( index < MAX_VERTEX_ATTRIBS ) {
 		gl.vertexAttribs[index].enabled = false;
 	}

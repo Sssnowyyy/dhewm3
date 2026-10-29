@@ -43,6 +43,7 @@ If you have questions concerning this license or the applicable additional terms
 #include "framework/CVarSystem.h"
 
 #include "sys/wiiu/wiiu_keyboard.h"
+#include "sys/wiiu/wiiu_renderthread.h"
 
 static bool			created;
 static bool			createFailed;
@@ -96,6 +97,8 @@ void WiiU_KeyboardShutdown( void ) {
 }
 
 void WiiU_KeyboardOpen( const void *_owner, const char *text, int maxChars, bool numeric ) {
+	// the render thread updates and draws it
+	WiiU_SyncRenderThreadFor( "keyboard" );
 	if ( !Create() || nn::swkbd::GetStateInputForm() != nn::swkbd::State::Hidden ) {
 		return;
 	}

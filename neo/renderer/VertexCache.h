@@ -31,7 +31,13 @@ If you have questions concerning this license or the applicable additional terms
 
 // vertex cache calls should only be made by the front end
 
+#ifdef __WIIU__
+// the Wii U's front end fills one frame's temp buffer while the back end (on
+// another thread) and the GPU still use the two before
+const int NUM_VERTEX_FRAMES = 3;
+#else
 const int NUM_VERTEX_FRAMES = 2;
+#endif
 
 typedef enum {
 	TAG_FREE,
@@ -137,6 +143,13 @@ private:
 	vertCache_t		freeDynamicHeaders;		// head of doubly linked list
 	vertCache_t		dynamicHeaders;			// head of doubly linked list
 	vertCache_t		deferredFreeList;		// head of doubly linked list
+#ifdef __WIIU__
+	// what was freed / used as frame temp in the frame before, the back end may
+	// still be drawing that frame on its own thread, see EndFrame()
+	vertCache_t		olderDeferredFreeList;
+	vertCache_t		olderDynamicHeaders;
+	static void		MoveList( vertCache_t &from, vertCache_t &to );
+#endif
 	vertCache_t		staticHeaders;			// head of doubly linked list in MRU order,
 											// staticHeaders.next is most recently used
 

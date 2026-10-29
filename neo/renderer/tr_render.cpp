@@ -834,7 +834,7 @@ void RB_CreateSingleDrawInteractions( const drawSurf_t *surf, void (*DrawInterac
 						RB_SubmittInteraction( &inter, DrawInteraction );
 					}
 // jmarshall - add no specular support(great for fill lighting).
-					if ( !allowNoSpecular || !vLight->lightDef->parms.noSpecular )
+					if ( !allowNoSpecular || !vLight->noSpecular )
 					{
 						R_SetDrawInteraction( surfaceStage, surfaceRegs, &inter.specularImage,
 												inter.specularMatrix, inter.specularColor.ToFloatPtr() );
