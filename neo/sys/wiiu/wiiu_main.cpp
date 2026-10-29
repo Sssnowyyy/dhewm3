@@ -170,14 +170,12 @@ main() return instead of calling exit() from it.
 ================
 */
 static void Wiiu_Exit( int ret ) {
+	Wiiu_LogEveryLine();
 	Sys_Printf( "Wiiu_Exit(%d)%s\n", ret, procExiting ? "" : ", going back to the Wii U Menu" );
-	if ( consoleLog != NULL ) {
-		fclose( consoleLog );
-		consoleLog = NULL;
-	}
 
 	// common->Shutdown() already did this unless we're here because of Sys_Error()
 	SDL_Quit();
+	Sys_Printf( "Wiiu_Exit: SDL shut down\n" );
 
 	if ( !procExiting ) {
 		SYSLaunchMenu();
@@ -186,6 +184,12 @@ static void Wiiu_Exit( int ret ) {
 		}
 	}
 	WHBProcShutdown();
+	Sys_Printf( "Wiiu_Exit: ProcUI shut down, ending the engine thread\n" );
+
+	if ( consoleLog != NULL ) {
+		fclose( consoleLog );
+		consoleLog = NULL;
+	}
 
 	if ( OSGetCurrentThread() == engineThread ) {
 		OSExitThread( ret );

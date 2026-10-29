@@ -500,6 +500,16 @@ void GLimp_Shutdown( void ) {
 	Wiiu_LogEveryLine();
 	common->Printf( "GLimp_Shutdown: stopping the render thread\n" );
 	StopRenderThread();
+	if ( !gx2Foreground ) {
+		// exiting from the HOME menu: ProcUI already took the GPU and the displays,
+		// touching them now can hang the console. Do what WHBGfxShutdown() does,
+		// just shut down GX2 (the memory goes away with the process anyway)
+		common->Printf( "GLimp_Shutdown: exiting, only shutting down GX2\n" );
+		GX2Shutdown();
+		gx2Initialized = false;
+		common->Printf( "GLimp_Shutdown: done\n" );
+		return;
+	}
 	common->Printf( "GLimp_Shutdown: render thread stopped, shutting down GX2\n" );
 	GX2GL_Shutdown();
 	WiiU_KeyboardShutdown();

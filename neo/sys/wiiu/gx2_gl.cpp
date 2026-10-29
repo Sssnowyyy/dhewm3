@@ -90,7 +90,7 @@ idCVar r_gx2Debug( "r_gx2Debug", "0", CVAR_RENDERER | CVAR_INTEGER, "print GX2 G
 #define FRAME_ARENA_SIZE	( 16 * 1024 * 1024 )
 #define NUM_FRAME_SLOTS		2
 
-idCVar r_gx2VerifyTextures( "r_gx2VerifyTextures", "1", CVAR_RENDERER | CVAR_BOOL, "diagnostics: read precompressed textures back from the GPU and compare them with what was uploaded" );
+idCVar r_gx2VerifyTextures( "r_gx2VerifyTextures", "0", CVAR_RENDERER | CVAR_BOOL, "diagnostics: read precompressed textures back from the GPU and compare them with what was uploaded" );
 idCVar r_gx2StateCache( "r_gx2StateCache", "1", CVAR_RENDERER | CVAR_BOOL, "only send render state, shaders and textures to the GPU when they change" );
 idCVar r_gx2Pipeline( "r_gx2Pipeline", "1", CVAR_RENDERER | CVAR_BOOL, "let the CPU prepare the next frame while the GPU draws the last one (0: wait for the GPU every frame)" );
 
